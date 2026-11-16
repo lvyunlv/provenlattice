@@ -297,6 +297,29 @@ class RaceConditionEvidenceTests(unittest.TestCase):
             }
             self.assertEqual(endpoints, related_ids)
 
+    def test_access_records_carry_source_file_and_stable_identity(self):
+        # G1: the projection must not drop the source location the engine's
+        # facts already carry -- every access keeps its file, its line range
+        # and its stable event/symbol identity (issue #76).
+        races = _races(WRONG_LOCK)
+        self.assertEqual(len(races), 1)
+        candidate = races[0]
+
+        related = candidate.get("related_accesses") or []
+        self.assertEqual(len(related), 2)
+        for item in related:
+            self.assertEqual(item["relative_path"], "src/t.c")
+            self.assertTrue(item["file_id"].startswith("file:"))
+            self.assertTrue(item["owner_symbol_id"].startswith("symbol:"))
+
+        access_records = candidate["evidence_v2"]["access"]
+        self.assertEqual(len(access_records), 2)
+        for record in access_records:
+            self.assertEqual(record["file"], "src/t.c")
+            self.assertTrue(record["owner_symbol_id"].startswith("symbol:"))
+            self.assertTrue(record["access_event_id"].startswith("event:"))
+            self.assertNotEqual(record["source_span"], [0, 0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -87,6 +87,38 @@ class DoubleFreeTests(DefectTestBase):
         self.assertTrue(cand["evidence_id"].startswith("E-DEFECT-"))
         self.assertTrue(any("release convention" in m for m in cand["missing_evidence"]))
 
+    def test_bundle_preserves_release_roles_and_reach(self) -> None:
+        # G2: the bundle must keep the two releases as independent first/second
+        # roles with their own source locations and the real reach answer,
+        # instead of flattening them into an order-guessed list (issue #76).
+        self.build(
+            "#include <stdlib.h>\n"
+            "int f01(int n) {\n"
+            "    char *p = malloc(64);\n"
+            "    if (!p) return -1;\n"
+            "    free(p);\n"
+            "    free(p);\n"
+            "    return n;\n"
+            "}\n")
+        env = self.query("double_free")
+        bundles = {b["candidate_id"]: b for b in env.get("evidence_bundles", [])}
+        self.assertEqual(len(bundles), 1)
+        bundle = next(iter(bundles.values()))
+        metadata = bundle.get("metadata") or {}
+        first = metadata.get("first_release") or {}
+        second = metadata.get("second_release") or {}
+        self.assertTrue(first.get("point", "").startswith("event:"))
+        self.assertTrue(second.get("point", "").startswith("event:"))
+        self.assertNotEqual(first.get("point"), second.get("point"))
+        self.assertEqual(first.get("source"), "src/t.c:5-5")
+        self.assertEqual(second.get("source"), "src/t.c:6-6")
+        self.assertEqual(first.get("subject"), "p")
+        self.assertEqual(second.get("subject"), "p")
+        self.assertIs(first.get("declared"), True)
+        self.assertIs(second.get("declared"), True)
+        # reach is the producer's real three-state string, never upgraded.
+        self.assertEqual(metadata.get("reach"), "reachable")
+
     def test_exclusive_branch_releases_are_not_a_candidate(self) -> None:
         # two releases of the same object on exclusive arms: the arms cannot
         # both execute, so the PR pairing eliminates the pair (0 candidates).

@@ -6945,4 +6945,5 @@ def candidate_bundle(
         resolution_status=candidate.resolution_status,
         confidence=candidate.confidence,
         generation=generation,
+        metadata=dict(candidate.metadata),
     )
