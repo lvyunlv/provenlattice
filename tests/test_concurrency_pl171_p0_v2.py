@@ -231,6 +231,79 @@ void starter(void) {
 }
 """
 
+# Regression (PAIR-05 / Issue #75): the starter joins an *unrelated* thread
+# (`unrelated_worker`) and then writes. The candidate pair is
+# (starter, guarded_worker); the join groups `unrelated_worker`, not the
+# candidate's other side, so the post-join happens-before does not hold and the
+# pair must be kept -- even though the other side (guarded_worker) is GRD good.
+POST_JOIN_UNRELATED = r"""
+#include <pthread.h>
+pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+int shared = 0;
+void *guarded_worker(void *arg) {
+    pthread_mutex_lock(&m);
+    shared = 1;
+    pthread_mutex_unlock(&m);
+    return NULL;
+}
+void *unrelated_worker(void *arg) {
+    return NULL;
+}
+void starter(void) {
+    pthread_t unrelated;
+    pthread_create(&unrelated, NULL, unrelated_worker, NULL);
+    pthread_join(unrelated, NULL);
+    shared = 2;
+}
+"""
+
+# Regression (PAIR-05 / Issue #75): a join whose handle cannot be resolved to a
+# declaration carries no identity, so the join cannot be bound to the other
+# side and the pair must be kept (fail-closed on missing identity).
+POST_JOIN_MISSING_HANDLE = r"""
+#include <pthread.h>
+pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+int shared = 0;
+void *worker(void *arg) {
+    pthread_mutex_lock(&m);
+    shared = 1;
+    pthread_mutex_unlock(&m);
+    return NULL;
+}
+void starter(void) {
+    pthread_join(g_thread, NULL);
+    shared = 2;
+}
+"""
+
+# Regression (PAIR-05 / Issue #75): a handle used to start two different entries
+# before the join is ambiguous -- the join could be either thread -- so the join
+# cannot be bound to the candidate's other side and the pair must be kept.
+POST_JOIN_AMBIGUOUS_HANDLE = r"""
+#include <pthread.h>
+pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+int shared = 0;
+void *worker(void *arg) {
+    pthread_mutex_lock(&m);
+    shared = 1;
+    pthread_mutex_unlock(&m);
+    return NULL;
+}
+void *other(void *arg) {
+    return NULL;
+}
+void starter(int mode) {
+    pthread_t t;
+    if (mode) {
+        pthread_create(&t, NULL, worker, NULL);
+    } else {
+        pthread_create(&t, NULL, other, NULL);
+    }
+    pthread_join(t, NULL);
+    shared = 2;
+}
+"""
+
 
 class PL171P0V2DetectorTests(unittest.TestCase):
     """GATE-1 unit matrix for the Issue #72 V2 candidate-level rules."""
@@ -272,6 +345,23 @@ class PL171P0V2DetectorTests(unittest.TestCase):
         # The spawner's only access is pre-spawn; the worker keeps two. Trim
         # empties the spawner side, so the pair must be dropped without crashing.
         self.assertEqual(_races(FULLY_TRIMMED_SPAWNER), [])
+
+    def test_11_post_join_unrelated_thread_kept(self):
+        # The starter joins an unrelated thread, not the candidate's guarded
+        # worker: the join is not bound to the other side, so PAIR-05 must not
+        # filter the pair.
+        self.assertEqual(len(_races(POST_JOIN_UNRELATED)), 1)
+
+    def test_12_post_join_missing_handle_kept(self):
+        # A join whose handle has no declaration identity cannot be bound to the
+        # other side; fail closed and keep the pair.
+        self.assertEqual(len(_races(POST_JOIN_MISSING_HANDLE)), 1)
+
+    def test_13_post_join_ambiguous_handle_kept(self):
+        # A handle started two different entries before the join; the join could
+        # be either, so it is not bound to the candidate's other side and the
+        # pair must be kept.
+        self.assertEqual(len(_races(POST_JOIN_AMBIGUOUS_HANDLE)), 1)
 
 
 if __name__ == "__main__":

@@ -3277,11 +3277,15 @@ def _spawn_index(points: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
     carry the positions (start_byte) of each method's THREAD_SPAWN and
     THREAD_JOIN points so the pair loop can decide, per end, whether an access
     runs before the other end's spawn (PAIR-01) or after its join (PAIR-05).
+    `joins_of` keeps each join's thread-handle identity (`subject_decl`) and
+    `spawn_handles` each spawn's handle, so PAIR-05 can bind a join to the
+    candidate's other-side thread instead of trusting any join in the method.
     """
     entry_of: dict[str, set[str]] = {}
     entries: set[str] = set()
     spawns_of: dict[str, list[tuple[int, str]]] = {}
-    joins_of: dict[str, list[int]] = {}
+    joins_of: dict[str, list[tuple[int, str]]] = {}
+    spawn_handles: dict[str, list[tuple[int, str, str]]] = {}
     for info in points.values():
         owner = str(info.get("owner_symbol_id", ""))
         if info["event_type"] == "THREAD_SPAWN":
@@ -3292,13 +3296,25 @@ def _spawn_index(points: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
                 spawns_of.setdefault(owner, []).append(
                     (int(info.get("start_byte") or 0), function)
                 )
+                spawn_handles.setdefault(owner, []).append(
+                    (
+                        int(info.get("start_byte") or 0),
+                        function,
+                        info.get("subject_decl", ""),
+                    )
+                )
         elif info["event_type"] == "THREAD_JOIN":
-            joins_of.setdefault(owner, []).append(int(info.get("start_byte") or 0))
+            joins_of.setdefault(owner, []).append(
+                (int(info.get("start_byte") or 0), info.get("subject_decl", ""))
+            )
     return {
         "entry_of": entry_of,
         "entries": entries,
         "spawns_of": {owner: tuple(sorted(items)) for owner, items in spawns_of.items()},
-        "joins_of": {owner: tuple(sorted(positions)) for owner, positions in joins_of.items()},
+        "joins_of": {owner: tuple(sorted(items)) for owner, items in joins_of.items()},
+        "spawn_handles": {
+            owner: tuple(sorted(items)) for owner, items in spawn_handles.items()
+        },
     }
 
 
@@ -3404,6 +3420,37 @@ def _side_guarded(
     return False
 
 
+def _join_bytes_bound_to(
+    owner: str,
+    other_short: str,
+    spawn_index: Mapping[str, Any],
+) -> list[int]:
+    """The THREAD_JOIN positions of `owner` that provably join the other side.
+
+    A join binds to a thread only by handle identity: the join's handle
+    (`subject_decl`) must be the one a THREAD_SPAWN in the *same* method
+    recorded as it started `other_short`'s entry, with the spawn preceding the
+    join. A join whose handle is missing, or whose handle was also used to start
+    a different entry before the join, is ambiguous and is not returned
+    (fail-closed) -- "this method joins a thread" is not the same fact as "this
+    method joins *that* thread".
+    """
+    spawns = spawn_index.get("spawn_handles", {}).get(owner, ())
+    joins = spawn_index.get("joins_of", {}).get(owner, ())
+    bound: list[int] = []
+    for join_byte, handle_decl in joins:
+        if not handle_decl:
+            continue
+        entries_before = {
+            entry
+            for byte, entry, decl in spawns
+            if decl == handle_decl and byte < join_byte
+        }
+        if entries_before == {other_short}:
+            bound.append(join_byte)
+    return bound
+
+
 def _safe_post_join_declines(
     owner_a: str,
     owner_b: str,
@@ -3422,24 +3469,26 @@ def _safe_post_join_declines(
     """PAIR-05: drop a pair only when one end is provably post-join and every
     other access is correctly guarded (GRD good).
 
-    An end whose method joins and whose *every* access follows the last join
-    cannot race the worker it joined -- but only when every access on the other
-    side is correctly guarded. Without that guard the "post-join" reasoning is
-    the excluded cross-lifetime PAIR-04 (a different lifetime's join does not
-    order this pair), so the pair is kept (fail-closed).
+    An end whose method joins -- the join provably bound to the *other* side's
+    thread entry -- and whose *every* access follows that join cannot race the
+    worker it joined. Without that guard the "post-join" reasoning is the
+    excluded cross-lifetime PAIR-04 (a different lifetime's join does not order
+    this pair), so the pair is kept (fail-closed).
     """
-    joins_of = spawn_index.get("joins_of") or {}
-    for owner, side_points, other_kind, other_owner, other_protection in (
-        (owner_a, points_a, kind_b, owner_b, protection_b),
-        (owner_b, points_b, kind_a, owner_a, protection_a),
+    short_a = _short_name((names or {}).get(owner_a, ""))
+    short_b = _short_name((names or {}).get(owner_b, ""))
+    for owner, side_points, other_short, other_kind, other_owner, other_protection in (
+        (owner_a, points_a, short_b, kind_b, owner_b, protection_b),
+        (owner_b, points_b, short_a, kind_a, owner_a, protection_a),
     ):
         positions = _access_positions(points, side_points)
         if not positions:
             continue
-        join_bytes = joins_of.get(owner, ())
+        join_bytes = _join_bytes_bound_to(owner, other_short, spawn_index)
         if not join_bytes:
             continue
-        # Every access of this side follows the last join -> provably post-join.
+        # Every access of this side follows the last bound join -> provably
+        # post-join of the candidate's other side.
         if min(positions) <= max(join_bytes):
             continue
         # Safe only when the other side is GRD good.
