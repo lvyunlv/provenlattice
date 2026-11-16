@@ -309,7 +309,7 @@ class DifferentLockCompetingTests(CompetingAccessBase):
         self.assertEqual(pairs[0]["confidence"], 0.3)
         self.assertEqual(
             [side["held_locks"] for side in pairs[0]["accesses"]],
-            [["m1"], ["m2"]],
+            [["global:m1"], ["global:m2"]],
         )
 
 

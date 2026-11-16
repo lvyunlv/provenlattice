@@ -275,7 +275,10 @@ class RaceConditionEvidenceTests(unittest.TestCase):
         lock = races[0]["evidence_v2"]["lock"]
         held = {frozenset(record.get("held_locks") or ())
                 for record in lock["access_locksets"]}
-        self.assertEqual(held, {frozenset({"lock_a"}), frozenset({"lock_b"})})
+        self.assertEqual(
+            held,
+            {frozenset({"global:lock_a"}), frozenset({"global:lock_b"})},
+        )
         relation_kinds = {r["relation"] for r in lock["relations"]}
         self.assertIn("PROTECTS", relation_kinds)
 
