@@ -372,7 +372,10 @@ def _race_related_accesses(
     already-computed ``_access_summary``). This only re-packages those citations
     into the ``related_accesses`` list the evidence-v2 adapter joins on -- every
     sub-fact (``access_kind``, ``is_write``, ``owner``, span) is read off the
-    already-materialized sparse-cfg event, never re-derived.
+    already-materialized sparse-cfg event, never re-derived. The source file
+    (``relative_path``), its ``file_id`` and the stable ``owner_symbol_id`` ride
+    along losslessly so the V2 ``access`` block can project a real ``file``
+    instead of an empty one (issue #76 G1).
 
     The events layer and sparse_cfg share one event id per access
     (``identity.event_id``), so the lockset projection (``build_access_lockset``)
@@ -400,6 +403,9 @@ def _race_related_accesses(
                 "is_write": annotations.get("is_write", ""),
                 "owner": event.get("owner_qualified_name")
                 or event.get("owner_symbol_id") or "",
+                "owner_symbol_id": event.get("owner_symbol_id") or "",
+                "relative_path": event.get("relative_path") or "",
+                "file_id": event.get("file_id") or "",
                 "start_line": int(event.get("start_line") or 0),
                 "end_line": int(event.get("end_line") or 0),
             })

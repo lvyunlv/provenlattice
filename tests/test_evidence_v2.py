@@ -20,6 +20,7 @@ from provenlattice.evidence import (
     CONFIDENCE_UNAVAILABLE,
     IS_WRITE_UNAVAILABLE,
     LOCK_FACTS_UNAVAILABLE,
+    SOURCE_FILE_UNAVAILABLE,
     TRACE_EVIDENCE_UNAVAILABLE,
     assemble_evidence_v2,
 )
@@ -196,6 +197,36 @@ class AccessBlockTests(unittest.TestCase):
         result = assemble_evidence_v2(candidate)
         self.assertEqual(result["access"], [])
         self.assertIn(ACCESS_EVENT_LINKAGE_UNAVAILABLE,
+                      result["confidence_limitation"]["limitations"])
+
+    def test_access_records_project_source_file_and_symbol_identity(self):
+        candidate = race_candidate()
+        candidate["related_accesses"] = [{
+            "event_id": "event:a:WRITE:10", "event_type": "WRITE",
+            "access_kind": "WRITE", "is_write": "true", "owner": "a",
+            "owner_symbol_id": "symbol:a", "relative_path": "src/a.c",
+            "start_line": 3, "end_line": 3,
+        }]
+        result = assemble_evidence_v2(candidate)
+        record = result["access"][0]
+        self.assertEqual(record["file"], "src/a.c")
+        self.assertEqual(record["owner_symbol_id"], "symbol:a")
+        self.assertEqual(record["access_event_id"], "event:a:WRITE:10")
+        self.assertEqual(record["source_span"], [3, 3])
+        self.assertNotIn(SOURCE_FILE_UNAVAILABLE,
+                        result["confidence_limitation"]["limitations"])
+
+    def test_access_records_file_missing_is_null_not_fabricated(self):
+        candidate = race_candidate()
+        candidate["related_accesses"] = [{
+            "event_id": "event:c:READ:30", "event_type": "READ",
+            "access_kind": "READ", "is_write": "false", "owner": "c",
+            "start_line": 5, "end_line": 5,
+        }]
+        result = assemble_evidence_v2(candidate)
+        record = result["access"][0]
+        self.assertIsNone(record["file"])
+        self.assertIn(SOURCE_FILE_UNAVAILABLE,
                       result["confidence_limitation"]["limitations"])
 
 

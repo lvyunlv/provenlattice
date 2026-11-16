@@ -291,6 +291,7 @@ class DefectEvidenceBundle:
     resolution_status: str
     confidence: float
     generation: int
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-native throughout: this goes straight into a query result's
@@ -309,6 +310,7 @@ class DefectEvidenceBundle:
             "resolution_status": self.resolution_status,
             "confidence": self.confidence,
             "generation": self.generation,
+            "metadata": dict(self.metadata),
         }
 
 
@@ -331,6 +333,7 @@ class DefectEvidenceBundle:
 ACCESS_EVENT_LINKAGE_UNAVAILABLE = "access_event_linkage_unavailable"
 ACCESS_KIND_UNAVAILABLE = "access_kind_unavailable"
 IS_WRITE_UNAVAILABLE = "is_write_unavailable"
+SOURCE_FILE_UNAVAILABLE = "source_file_unavailable"
 LOCK_FACTS_UNAVAILABLE = "lock_facts_unavailable"
 TRACE_EVIDENCE_UNAVAILABLE = "trace_evidence_unavailable"
 CONFIDENCE_UNAVAILABLE = "confidence_unavailable"
@@ -399,12 +402,17 @@ def assemble_evidence_v2(
         is_write = _normalize_is_write(item.get("is_write"))
         if is_write is None:
             limitations.add(IS_WRITE_UNAVAILABLE)
+        file_path = item.get("file") or item.get("relative_path") or None
+        if not file_path:
+            limitations.add(SOURCE_FILE_UNAVAILABLE)
         access_records.append({
             "access_event_id": str(event_id),
             "event_type": item.get("event_type"),
             "access_kind": access_kind,
             "is_write": is_write,
             "owner": item.get("owner"),
+            "owner_symbol_id": item.get("owner_symbol_id"),
+            "file": file_path,
             "source_span": [
                 int(item.get("start_line") or 0),
                 int(item.get("end_line") or 0),
