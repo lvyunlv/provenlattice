@@ -6918,6 +6918,29 @@ def candidate_evidence(
     )
 
 
+def _bundle_metadata(candidate: Candidate) -> dict[str, Any]:
+    """The bundle-level metadata surface for one candidate.
+
+    The bundle's ``metadata`` exposes a small, deliberate result contract, never
+    the candidate's full internal bookkeeping. ``candidate.metadata`` carries
+    both the public per-query contract fields and private keys (``anchor_span``,
+    ``methods``, ``exit_point``, ``path_recorded``, ``paths_truncated``) that
+    ``candidate_evidence`` reads directly off the candidate; leaking them
+    through the bundle would freeze internal detail into a result shape. Only
+    the double-free query has a bundle-facing metadata contract, and it is the
+    three release-role fields the evidence-v2 adapter needs to keep the two
+    releases un-flattened (issue #76 G2): ``first_release``, ``second_release``,
+    ``reach``. Every other query keeps an empty surface.
+    """
+    if candidate.defect_key != DOUBLE_FREE_KEY:
+        return {}
+    return {
+        key: candidate.metadata[key]
+        for key in ("first_release", "second_release", "reach")
+        if key in candidate.metadata
+    }
+
+
 def candidate_bundle(
     candidate: Candidate,
     *,
@@ -6945,5 +6968,5 @@ def candidate_bundle(
         resolution_status=candidate.resolution_status,
         confidence=candidate.confidence,
         generation=generation,
-        metadata=dict(candidate.metadata),
+        metadata=_bundle_metadata(candidate),
     )

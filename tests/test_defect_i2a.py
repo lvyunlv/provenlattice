@@ -118,6 +118,13 @@ class DoubleFreeTests(DefectTestBase):
         self.assertIs(second.get("declared"), True)
         # reach is the producer's real three-state string, never upgraded.
         self.assertEqual(metadata.get("reach"), "reachable")
+        # The bundle metadata surface stays minimal: the internal bookkeeping
+        # keys (anchor_span / methods / exit_point / path_recorded /
+        # paths_truncated) live on the candidate, not the bundle (issue #76
+        # metadata scope refinement).
+        for hidden in ("anchor_span", "methods", "exit_point",
+                       "path_recorded", "paths_truncated"):
+            self.assertNotIn(hidden, metadata)
 
     def test_exclusive_branch_releases_are_not_a_candidate(self) -> None:
         # two releases of the same object on exclusive arms: the arms cannot
