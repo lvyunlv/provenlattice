@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Callable, Collection, Iterable, Mapping, Sequence
 
 from .contracts import FUNCTION_STATIC_STORAGE, ContractTable
+from .concurrency_lock_scenarios import canonical_lock_identity
 from .evidence import DefectEvidenceBundle, Evidence
 from .models import (
     STORAGE_FIELD, STORAGE_FILE_STATIC, STORAGE_FUNCTION_STATIC, STORAGE_GLOBAL,
@@ -2977,14 +2978,14 @@ def _lock_mode_index(
     for info in points.values():
         if info["event_type"] != "LOCK":
             continue
-        subject = str(info.get("subject") or "")
-        if not subject or info.get("subject_exact") != "true":
+        identity = canonical_lock_identity(info)
+        if not identity or info.get("subject_exact") != "true":
             continue
         matched_name = str(info.get("matched_name") or "")
         if not matched_name or matched_name in NON_BLOCKING_ACQUIRES:
             continue
         owner = str(info.get("owner_symbol_id", ""))
-        index.setdefault((owner, subject), set()).add(_lock_mode(matched_name))
+        index.setdefault((owner, identity), set()).add(_lock_mode(matched_name))
     return {key: frozenset(modes) for key, modes in index.items()}
 
 

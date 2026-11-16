@@ -47,6 +47,9 @@
 
 - additive、无 SQL schema / 物理 edge 变更；旧 `candidates` / `evidence` /
   `evidence_bundles` 字段零回退（集成红线回归核验）。
+- `held_locks`、`relation.lock`、`relation.locks` 的字段形状不变，但值语义由锁名
+  拼写收紧为 canonical declaration identity；显示锁名的消费者应使用原始 point 的
+  `subject`/`matched_name`，不得把 identity 字段当作 UI label。
 - analyzer 版本 bump：`ast:c` 3→4、`sparse_cfg:cpp` 1→4（缓存自动失效）。
 
 ### 明确限制（fail-closed 边界）

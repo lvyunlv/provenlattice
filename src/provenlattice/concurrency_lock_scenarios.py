@@ -1,9 +1,9 @@
 """S5 lock scenario candidates (Parent #28): lock_pairing / lock_discipline.
 
 Consumes S3's lock facts -- LOCK/UNLOCK vocabulary events carrying
-``lock_identity``, ``subject_exact``, ``acquire_kind`` and ``raii`` -- and emits
-Candidate rules for the two lock scenarios. The facts are reused as-is: lock
-identity, acquire kind and RAII are never re-derived here, and the events layer,
+``subject_exact``, ``acquire_kind`` and ``raii`` -- and emits Candidate rules
+for the two lock scenarios. Mode, acquire kind and RAII are reused as-is;
+declaration identity comes from the sparse points joined by event id.
 ``defect.py``'s ``lock_order``, the default index and CLI/MCP are untouched.
 
 Every candidate is an evidence-resolution state, never a verified finding. The
@@ -29,6 +29,8 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Iterable, Mapping
 
+from .models import STORAGE_FUNCTION_STATIC, STORAGE_LOCAL, STORAGE_PARAMETER
+
 _LOCK = "LOCK"
 _UNLOCK = "UNLOCK"
 
@@ -50,6 +52,37 @@ _RULE_BLOCKING_IN_LOCK = "blocking_inside_lock"
 _MISSING_CONTROL_FLOW = "control_flow"
 _MISSING_IDENTITY = "lock_identity_inexact"
 _MISSING_TRY_TIMED_OUTCOME = "try_timed_outcome"
+
+_METHOD_LOCAL_STORAGES = frozenset({
+    STORAGE_LOCAL, STORAGE_PARAMETER, STORAGE_FUNCTION_STATIC,
+})
+
+
+def canonical_lock_identity(point: Mapping[str, Any]) -> str:
+    """Return the sparse point's canonical declaration identity.
+
+    Method-owned declarations include their owner; global/static declarations
+    are already qualified by the declaration token. Missing declaration or a
+    missing owner for local storage is unresolved and therefore fails closed.
+    """
+    annotations = point.get("annotations")
+    annotations = annotations if isinstance(annotations, Mapping) else {}
+
+    def fact(name: str) -> str:
+        return str(point.get(name) or annotations.get(name) or "")
+
+    declaration = fact("subject_decl")
+    if not declaration:
+        return ""
+    member = fact("subject_member")
+    if fact("subject_storage") in _METHOD_LOCAL_STORAGES:
+        owner = fact("owner_symbol_id")
+        if not owner:
+            return ""
+        base = f"{owner}#{declaration}"
+    else:
+        base = declaration
+    return f"{base}#{member}" if member else base
 
 
 def _owner(event: Mapping[str, Any]) -> str:
@@ -343,10 +376,12 @@ def _owner_label(event: Mapping[str, Any]) -> str:
     return event.get("owner_qualified_name") or event.get("owner_symbol_id") or ""
 
 
-def _lock_fact_of(event: Mapping[str, Any]) -> dict[str, Any]:
+def _lock_fact_of(
+    event: Mapping[str, Any], sparse_point: Mapping[str, Any] | None,
+) -> dict[str, Any]:
     scope_end = event.get("raii_scope_end")
     return {
-        "lock_identity": event.get("lock_identity") or "",
+        "lock_identity": canonical_lock_identity(sparse_point or {}),
         "subject_exact": bool(event.get("subject_exact")),
         "acquire_kind": event.get("acquire_kind") or _ACQUIRE_BLOCKING,
         "raii": bool(event.get("raii")),
@@ -626,9 +661,9 @@ def build_access_lockset(
 
     ``sparse_events`` and ``edges`` are a `sparse_cfg` query's ``events`` and
     ``edges`` lists; ``lock_facts`` is an `events` query's ``events`` list (the
-    S3 lock facts: ``lock_identity``/``subject_exact``/``acquire_kind``/
-    ``raii``). LOCK/UNLOCK ids are shared across the two analyzers, so the lock
-    facts join onto the sparse CFG by event id.
+    S3 exactness/mode/acquisition facts). LOCK/UNLOCK ids are shared across the
+    two analyzers, so those facts join onto sparse declaration identities by
+    event id.
 
     The function is pure and deterministic. It never modifies the graph, never
     derives a new points-to or underlying relation, and never reports a locked
@@ -636,8 +671,14 @@ def build_access_lockset(
     """
     sparse = list(sparse_events)
     edges = list(edges)
+    sparse_by_id = {
+        event.get("event_id"): event
+        for event in sparse
+        if event.get("event_id")
+    }
     lock_by_id: dict[str, dict[str, Any]] = {
-        event.get("event_id"): _lock_fact_of(event)
+        event.get("event_id"): _lock_fact_of(
+            event, sparse_by_id.get(event.get("event_id")))
         for event in lock_facts
         if event.get("event_type") in (_LOCK, _UNLOCK) and event.get("event_id")
     }

@@ -86,7 +86,7 @@ class SameLockProtectedTests(AccessLocksetBase):
 
     def test_shared_subject_is_held_under_the_same_lock(self) -> None:
         for record in self.accesses("g_count"):
-            self.assertEqual(record["held_locks"], ["g_lock"])
+            self.assertEqual(record["held_locks"], ["global:g_lock"])
             self.assertEqual(record["candidate_state"], "ambiguous")
 
     def test_no_different_lock_on_shared_subject(self) -> None:
@@ -103,7 +103,7 @@ class SameLockProtectedTests(AccessLocksetBase):
         ]
         self.assertTrue(same)
         for rel in same:
-            self.assertEqual(rel["locks"], ["g_lock"])
+            self.assertEqual(rel["locks"], ["global:g_lock"])
 
     def test_every_record_is_ambiguous(self) -> None:
         bundle = self.lockset()
@@ -132,8 +132,8 @@ class DifferentLockTests(AccessLocksetBase):
         held = {}
         for record in self.accesses("g_count"):
             held.setdefault(record["owner"], set()).update(record["held_locks"])
-        self.assertEqual(held.get("f"), {"a"})
-        self.assertEqual(held.get("g"), {"b"})
+        self.assertEqual(held.get("f"), {"global:a"})
+        self.assertEqual(held.get("g"), {"global:b"})
 
     def test_different_lock_relation_is_both_protected(self) -> None:
         different = [
@@ -177,11 +177,11 @@ class UnlockOmittedTests(AccessLocksetBase):
 
     def test_omitted_unlock_is_flagged_not_fabricated(self) -> None:
         for record in self.accesses("g_count"):
-            self.assertEqual(record["held_locks"], ["g_lock"])
+            self.assertEqual(record["held_locks"], ["global:g_lock"])
         omitted = self.relations("UNLOCK_OMITTED_ON_PATH")
         self.assertTrue(omitted)
         for rel in omitted:
-            self.assertEqual(rel["lock"], "g_lock")
+            self.assertEqual(rel["lock"], "global:g_lock")
             self.assertEqual(rel["candidate_state"], "ambiguous")
 
 
@@ -227,7 +227,7 @@ class LoopProtectedTests(AccessLocksetBase):
 
     def test_loop_body_access_is_held(self) -> None:
         for record in self.accesses("g_count"):
-            self.assertEqual(record["held_locks"], ["g_lock"])
+            self.assertEqual(record["held_locks"], ["global:g_lock"])
         self.assertTrue(self.relations("PROTECTS"))
 
 
@@ -256,8 +256,8 @@ class TwoLockLoopTests(AccessLocksetBase):
         held_by_line = {}
         for record in self.accesses("g_count"):
             held_by_line[record["start_line"]] = record["held_locks"]
-        self.assertEqual(held_by_line[7], ["a"])
-        self.assertEqual(held_by_line[11], ["b"])
+        self.assertEqual(held_by_line[7], ["global:a"])
+        self.assertEqual(held_by_line[11], ["global:b"])
 
 
 class RaiiScopeHeldTests(AccessLocksetBase):
@@ -282,10 +282,10 @@ class RaiiScopeHeldTests(AccessLocksetBase):
 
     def test_raii_is_held_within_its_scope(self) -> None:
         for record in self.accesses("g_count"):
-            self.assertEqual(record["held_locks"], ["m"])
+            self.assertEqual(record["held_locks"], ["global:m"])
         protects = self.relations("PROTECTS")
         self.assertTrue(protects)
-        self.assertEqual({rel["lock"] for rel in protects}, {"m"})
+        self.assertEqual({rel["lock"] for rel in protects}, {"global:m"})
 
     def test_raii_implicit_release_is_not_a_leak(self) -> None:
         # The guard releases at scope exit without an explicit UNLOCK, so there
@@ -318,7 +318,7 @@ class RaiiInnerScopeEndTests(AccessLocksetBase):
         return result
 
     def test_access_inside_scope_is_held(self) -> None:
-        self.assertEqual(self.held_by_line()[5], ["m"])
+        self.assertEqual(self.held_by_line()[5], ["global:m"])
 
     def test_access_after_scope_end_is_not_held(self) -> None:
         # The trailing `g_count++` (line 6) sits after the inner block's `}`
@@ -336,6 +336,63 @@ class RaiiInnerScopeEndTests(AccessLocksetBase):
         }
         self.assertEqual(protected_ids, inner_ids)
         self.assertTrue(protected_ids.isdisjoint(trailing_ids))
+
+
+class SameSpellingDifferentDeclarationTests(AccessLocksetBase):
+    FIXTURE = (
+        "#include <pthread.h>\n"
+        "int shared;\n"
+        "void writer(void) {\n"
+        "    pthread_mutex_t m;\n"
+        "    pthread_mutex_lock(&m);\n"
+        "    shared++;\n"
+        "    pthread_mutex_unlock(&m);\n"
+        "}\n"
+        "void reader(void) {\n"
+        "    pthread_mutex_t m;\n"
+        "    pthread_mutex_lock(&m);\n"
+        "    shared++;\n"
+        "    pthread_mutex_unlock(&m);\n"
+        "}\n"
+    )
+
+    def test_same_spelling_local_locks_have_distinct_canonical_identities(self) -> None:
+        held = {
+            record["owner"]: tuple(record["held_locks"])
+            for record in self.accesses("shared")
+        }
+        self.assertEqual(set(held), {"writer", "reader"})
+        self.assertEqual(len(set(held.values())), 2)
+        self.assertTrue(all(values and "#local:m" in values[0] for values in held.values()))
+
+    def test_same_spelling_local_locks_do_not_emit_same_lock(self) -> None:
+        same = [
+            rel for rel in self.relations("SAME_LOCK")
+            if rel["subject"] == "global:shared"
+            and set(rel["owners"]) == {"writer", "reader"}
+        ]
+        self.assertEqual(same, [])
+
+
+class SameDeclarationRepeatedAcquireTests(AccessLocksetBase):
+    FIXTURE = (
+        "#include <pthread.h>\n"
+        "pthread_mutex_t m;\n"
+        "int shared;\n"
+        "void writer(void) {\n"
+        "    pthread_mutex_lock(&m);\n"
+        "    shared++;\n"
+        "    pthread_mutex_unlock(&m);\n"
+        "    pthread_mutex_lock(&m);\n"
+        "    shared++;\n"
+        "    pthread_mutex_unlock(&m);\n"
+        "}\n"
+    )
+
+    def test_repeated_acquires_of_one_declaration_use_one_identity(self) -> None:
+        held = [tuple(record["held_locks"]) for record in self.accesses("shared")]
+        self.assertTrue(held)
+        self.assertEqual(set(held), {("global:m",)})
 
 
 class InexactIdentityTests(AccessLocksetBase):
