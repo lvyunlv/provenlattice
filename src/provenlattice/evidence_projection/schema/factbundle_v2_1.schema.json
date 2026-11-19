@@ -1,0 +1,197 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://provenlattice/evidence_projection/schema/factbundle_v2_1.schema.json",
+  "title": "FactBundle v2.1 (candidate-bound evidence projection)",
+  "description": "Envelope contract for the GATE-0 evidence projection chain: a real defect-query result projected onto candidate-bound racing-access rows (race_condition) and release sites (double_free), with a Candidate <-> Evidence binding proof. api_version stays 'v1.1' for back-compat; v2.1 adds the version/coverage/evidence-location keys.",
+  "type": "object",
+  "required": [
+    "api_version",
+    "status",
+    "defect_type",
+    "facts",
+    "supporting_locations",
+    "request",
+    "schema_version",
+    "contract_version",
+    "projection_version",
+    "adapter_version",
+    "core_adapter_version",
+    "location_coverage",
+    "evidence_locations"
+  ],
+  "properties": {
+    "api_version": { "const": "v1.1" },
+    "schema_version": { "const": "2.1" },
+    "contract_version": { "const": "skill-graph-factbundle-contract-v2.1" },
+    "projection_version": { "const": "factbundle-projection-v2.1" },
+    "adapter_version": { "type": "string", "minLength": 1 },
+    "core_adapter_version": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "partial", "empty", "unsupported_only", "stale", "not_built", "failed", "timeout"]
+    },
+    "defect_type": { "type": "string", "enum": ["race_condition", "double_free"] },
+    "error": { "type": ["string", "null"] },
+    "reason": { "type": ["string", "null"] },
+    "facts": {
+      "type": "object",
+      "properties": {
+        "shared_accesses": {
+          "type": "object",
+          "required": ["value"],
+          "properties": {
+            "value": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/sharedAccessEntry" }
+            }
+          }
+        },
+        "release_sites": {
+          "type": "object",
+          "required": ["value"],
+          "properties": {
+            "value": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/releaseSiteEntry" }
+            }
+          }
+        }
+      }
+    },
+    "supporting_locations": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/location" }
+    },
+    "evidence_locations": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/evidenceLocation" }
+    },
+    "location_coverage": { "$ref": "#/definitions/locationCoverage" },
+    "request": {
+      "type": "object",
+      "required": ["entry", "defect_type", "case_workdir", "database", "target_symbols"],
+      "properties": {
+        "entry": { "type": "string" },
+        "defect_type": { "type": "string" },
+        "case_workdir": { "type": "string" },
+        "database": { "type": ["string", "null"] },
+        "target_symbols": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+  "definitions": {
+    "sharedAccessEntry": {
+      "type": "object",
+      "required": ["candidate_key", "access_rows"],
+      "properties": {
+        "identity": { "type": "string" },
+        "subject": { "type": "string" },
+        "candidate_key": { "type": "string", "minLength": 1 },
+        "evidence_id": { "type": "string" },
+        "defect_key": { "type": "string" },
+        "discriminator": { "type": "string" },
+        "access_rows": { "type": "array", "items": { "$ref": "#/definitions/accessRow" } },
+        "primary_anchor": { "$ref": "#/definitions/anchor" }
+      }
+    },
+    "releaseSiteEntry": {
+      "type": "object",
+      "required": ["candidate_key", "release_sites"],
+      "properties": {
+        "identity": { "type": "string" },
+        "subject": { "type": "string" },
+        "candidate_key": { "type": "string", "minLength": 1 },
+        "evidence_id": { "type": "string" },
+        "defect_key": { "type": "string" },
+        "discriminator": { "type": "string" },
+        "release_sites": { "type": "array", "items": { "$ref": "#/definitions/location" } },
+        "primary_anchor": { "$ref": "#/definitions/anchor" }
+      }
+    },
+    "accessRow": {
+      "type": "object",
+      "required": ["method", "file", "line", "kind", "non_atomic", "decided", "candidate_key"],
+      "properties": {
+        "method": { "type": "string" },
+        "file": { "type": "string" },
+        "line": { "type": "integer" },
+        "kind": { "type": "string" },
+        "non_atomic": { "type": "boolean" },
+        "decided": { "type": "boolean" },
+        "owner": { "type": "string" },
+        "method_symbol_id": { "type": "string" },
+        "owner_symbol_id": { "type": "string" },
+        "access_type": { "type": "string" },
+        "line_span": { "type": "array", "items": { "type": "integer" } },
+        "event_id": { "type": "string" },
+        "source_fact_id": { "type": "string" },
+        "provenance": { "type": "string" },
+        "held_locks": { "type": "array", "items": { "type": "string" } },
+        "candidate_key": { "type": "string", "minLength": 1 }
+      }
+    },
+    "location": {
+      "type": "object",
+      "required": [
+        "file", "line", "role", "semantic_role", "anchor_class", "owner",
+        "access_type", "source_fact_id", "provenance", "candidate_key",
+        "line_span", "held_locks"
+      ],
+      "properties": {
+        "file": { "type": "string" },
+        "line": { "type": "integer" },
+        "role": { "type": "string" },
+        "semantic_role": { "type": "string" },
+        "anchor_class": { "type": "string", "enum": ["primary", "supporting", "unresolved"] },
+        "owner": { "type": "string" },
+        "access_type": { "type": "string" },
+        "source_fact_id": { "type": "string" },
+        "event_id": { "type": "string" },
+        "provenance": { "type": "string" },
+        "candidate_key": { "type": "string", "minLength": 1 },
+        "line_span": { "type": "array", "items": { "type": "integer" } },
+        "held_locks": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "anchor": {
+      "type": ["object", "null"],
+      "required": ["file", "line", "line_span", "provenance"],
+      "properties": {
+        "file": { "type": "string" },
+        "line": { "type": "integer" },
+        "line_span": { "type": "array", "items": { "type": "integer" } },
+        "provenance": { "type": "string" }
+      }
+    },
+    "evidenceLocation": {
+      "type": "object",
+      "required": ["candidate_key", "access_rows", "release_sites"],
+      "properties": {
+        "candidate_key": { "type": "string", "minLength": 1 },
+        "evidence_id": { "type": "string" },
+        "defect_key": { "type": "string" },
+        "discriminator": { "type": "string" },
+        "subject": { "type": "string" },
+        "identity": { "type": "string" },
+        "primary_anchor": { "$ref": "#/definitions/anchor" },
+        "access_rows": { "type": "array", "items": { "$ref": "#/definitions/accessRow" } },
+        "release_sites": { "type": "array", "items": { "$ref": "#/definitions/location" } }
+      }
+    },
+    "locationCoverage": {
+      "type": "object",
+      "required": [
+        "candidates", "with_primary_anchor", "with_access_locations",
+        "with_support_locations", "unlocated_candidates", "by_semantic_role"
+      ],
+      "properties": {
+        "candidates": { "type": "integer" },
+        "with_primary_anchor": { "type": "integer" },
+        "with_access_locations": { "type": "integer" },
+        "with_support_locations": { "type": "integer" },
+        "unlocated_candidates": { "type": "array", "items": { "type": "string" } },
+        "by_semantic_role": { "type": "object" }
+      }
+    }
+  }
+}
