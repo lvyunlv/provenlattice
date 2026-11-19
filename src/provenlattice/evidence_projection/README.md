@@ -1,22 +1,25 @@
 # ProvenLattice Evidence Projection — FactBundle v2.1 (GATE-0)
 
 Candidate-bound evidence projection over the **real** ProvenLattice defect
-query. This package is the GATE-0 delivery of Issue #78: it reproduces the
-real-graph fact delivery chain (`query_defect` → evidence projection →
-FactBundle v2.1 binding + validation) for exactly two defect types, and
-deliberately does **not** build the generic Evidence IR, Projector Registry,
-multi-defect extension, or the five-interface Agent/Skill API (those are
-later phases, authorised separately).
+query. The GATE-0 delivery (Issue #78) reproduces the real-graph fact delivery
+chain (`query_defect` → evidence projection → FactBundle v2.1 binding +
+validation) for exactly two defect types. Issue #79 adds, additively and
+separately, the **Canonical Evidence IR V1** (`ir.py`) that projects a
+FactBundle v2.1 into a versioned, machine-verifiable unified evidence structure.
+It deliberately does **not** build the Projector Registry, multi-defect
+extension, or the five-interface Agent/Skill API (those are later phases,
+authorised separately).
 
 ## Scope
 
-| Authorised (GATE-0)                                   | NOT authorised |
-| ----------------------------------------------------- | -------------- |
-| `analyze_shared_access` (Race Condition)              | Canonical Evidence IR |
-| `analyze_double_free` (Double Free)                   | Projector Registry |
-| FactBundle v2.1 compatible envelope + validation      | multi-defect extension |
-| Candidate ↔ Evidence binding proof                     | Agent / Skill API |
-| `schema/`, `fixtures/`, this README, `tests/`          | Skill-consumer integration |
+| Authorised (GATE-0 + #79)                              | NOT authorised (later phases) |
+| ------------------------------------------------------ | ----------------------------- |
+| `analyze_shared_access` (Race Condition)               | Projector Registry            |
+| `analyze_double_free` (Double Free)                    | multi-defect extension        |
+| FactBundle v2.1 compatible envelope + validation       | Agent / Skill API             |
+| Candidate ↔ Evidence binding proof                      | Skill-consumer integration    |
+| Canonical Evidence IR V1 (`ir.py`, Issue #79)          |                               |
+| `schema/`, `fixtures/`, this README, `tests/`          |                               |
 
 The implementation lives **only** under
 `src/provenlattice/evidence_projection/` (plus its tests). No engine fact
@@ -34,7 +37,11 @@ release/version/tag is modified.
 * `source.py` — fail-closed wrapper over the single real entry point
   `provenlattice.defect_query.query_defect_candidates`.
 * `adapter.py` — the two public `analyze_*` entry points + `validate_bundle_v2`.
+* `ir.py` — Canonical Evidence IR V1 (Issue #79): `factbundle_v2_1_to_ir` +
+  `validate_evidence_ir_v1` + the 9-block + `source_envelope` mapping. Pure and
+  engine-free.
 * `schema/factbundle_v2_1.schema.json` — JSON Schema for the v2.1 envelope.
+* `schema/evidence_ir_v1.schema.json` — JSON Schema for the Canonical Evidence IR V1.
 * `fixtures/` — real captured candidate records + real FactBundle v2.1 bundles.
 
 ## Dependency closure (audit trail)
@@ -108,6 +115,92 @@ issues = validate_bundle_v2("analyze_double_free", bundle)  # [] == bound
 (optional) narrows to one subject symbol. A fail-closed terminal (`stale`,
 `not_built`, `failed`, `empty`) carries **zero** projected candidates — the
 envelope may not assert a binding it does not have.
+
+## Canonical Evidence IR V1 (Issue #79)
+
+`ir.py` adds, additively, the **Canonical Evidence IR V1** — the *evidence
+expression* stage that follows GATE-0's *evidence transport* stage. It is a
+pure, deterministic, engine-free projection of a FactBundle v2.1 envelope into
+a versioned, additive, machine-verifiable structure. It does **not** build the
+Projector Registry, a multi-defect protocol, or an Agent/Skill API.
+
+### Structure: 9 blocks + lossless fallback
+
+| Block | Meaning |
+| ----- | ------- |
+| `run` | code revision / engine version / DB snapshot identity (from `run_context`, else `NOT_RECORDED`) + source schema / contract / projection / adapter / projector versions + query params + error/reason |
+| `candidates` | stable non-empty id (`candidate.id` = verbatim GATE-0 `candidate_key`, C5), defect type, identity/subject, primary anchor |
+| `claims` | falsifiable propositions + `SUPPORTED` / `UNSUPPORTED` / `UNKNOWN` / `PARTIAL`; V1 emits `[]` (not a detector, C3) |
+| `facts` | atomic engine facts preserving the real fact/event id |
+| `relations` | typed relations, only when evidence-backed; V1 emits `[]` (no inference, C4) |
+| `locations` | source location, owner, semantic role, anchor class (no `held_locks`) |
+| `provenance` | Engine fact → Candidate → Projector → Bundle trace chain |
+| `coverage` | only `source_location` (the GATE-0 `location_coverage`, C4) |
+| `limitations` | explicit degradation statements; never empty/`false` to mean "unknown" |
+| `source_envelope` | deep copy of the original bundle — lossless fallback (C1) |
+
+> The issue's prose names the candidate block `candidate` (singular); it is
+> realised here as a `candidates` array because a FactBundle v2.1 may carry
+> several candidate bindings (acceptance M4 cross-candidate pollution, M15
+> candidate identity boundary). Each element carries `candidate.id` (verbatim
+> `candidate_key`), `defect_type`, `identity`, `subject`, `primary_anchor` and
+> the identity evidence.
+
+### Field mapping (FactBundle v2.1 → IR)
+
+| FactBundle v2.1 | IR |
+| --------------- | -- |
+| `api_version` | `source_envelope` (not merged into `ir_schema_version`) |
+| `schema_version` | `run.source_schema_version` + `source_envelope` |
+| `contract_version` | `run.contract_version` + `source_envelope` |
+| `projection_version` | `run.projection_version` |
+| `adapter_version` | `run.adapter_version` |
+| `core_adapter_version` | `run.core_adapter_version` (may be empty) |
+| `status` | top-level `bundle_status` (independent; never → claim status) |
+| `defect_type` | `candidate.defect_type` |
+| `error` / `reason` | `run.error` / `run.reason` + `source_envelope` |
+| `facts` | IR `facts` + `source_envelope.facts` |
+| `supporting_locations` | IR `locations` + `source_envelope` |
+| `evidence_locations` | IR `locations` + `candidates` (binding) + `source_envelope` |
+| `location_coverage` | `coverage.source_location` + `source_envelope` |
+| `request` | `run.query_params` + `source_envelope` |
+| `candidate_key` | `candidate.id` (verbatim, C5) |
+| `evidence_id` / `defect_key` / `discriminator` | `candidate.*` |
+| `identity` / `subject` | `candidate.identity` / `candidate.subject` |
+| access_row `event_id` / `source_fact_id` | `facts` (real fact/event id) |
+| access_row `held_locks` | `source_envelope` only (C4, never → `GUARDED_BY`) |
+
+Fallback (C1): every unlisted field is preserved verbatim in `source_envelope`;
+there is no silent drop, no normalisation / reorder / type coercion of original
+values.
+
+### Version compatibility (E2)
+
+- `ir_schema_version` (`"1"`) — the IR's own structure version.
+- `projection_version` (`factbundle-projection-v2.1`) — the existing GATE-0
+  projection implementation.
+- `adapter_version` (`provenlattice-evidence-projection-v1`) — the adapter
+  implementation.
+- `projector_version` (`NOT_APPLICABLE`) — no Projector Registry in this phase;
+  **not** to be conflated with `projection_version`.
+
+V1 is additive / forward-compatible: consumers ignore unknown optional fields;
+published required fields are never removed or re-semanticised.
+
+### Entry points
+
+```python
+from provenlattice.evidence_projection import ir
+
+evidence = ir.factbundle_v2_1_to_ir(bundle, run_context={"code_revision": "..."})
+problems = ir.validate_evidence_ir_v1(evidence)  # [] == valid
+```
+
+`factbundle_v2_1_to_ir` is pure and deterministic; it never mutates `bundle`,
+never reads the engine / git HEAD / DB, and emits `claims == []` /
+`relations == []`. `validate_evidence_ir_v1` returns a list of problem strings
+(empty == valid) and proves the candidate↔evidence binding plus the M1–M15
+structure. Test coverage lives in `tests/test_evidence_ir.py`.
 
 ## Testing
 
