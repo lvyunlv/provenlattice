@@ -1,0 +1,275 @@
+{
+  "defect_key": "1.1",
+  "query": "race_condition",
+  "subject": {
+    "kind": "shared_name",
+    "name": "shared",
+    "identity": "global:shared",
+    "method": "reader",
+    "owner_symbol_id": "symbol:25b4faa79573579045891be23bf7e040debaa6fde72f613fbd2337eb352740e6",
+    "storage": "global",
+    "type": "int",
+    "member": "",
+    "decl": "global:shared"
+  },
+  "anchor": "event:b40801f937820c26dab6e86266b9ce61787f0b6c2ee45a5ed25cbac9a6eaf54d",
+  "discriminator": "global:shared|symbol:25b4faa79573579045891be23bf7e040debaa6fde72f613fbd2337eb352740e6|symbol:c7d08729d22d3b497a8cf61d277b995305799adcf4aa95a30f343552f6bcfdaf",
+  "resolution_status": "ambiguous",
+  "confidence": 0.5,
+  "facts": [
+    {
+      "event": "READ",
+      "method": "reader",
+      "point": "event:b40801f937820c26dab6e86266b9ce61787f0b6c2ee45a5ed25cbac9a6eaf54d",
+      "subject": "shared",
+      "subject_from": "",
+      "matched_name": "shared",
+      "source": "src/t.c:4-4"
+    },
+    {
+      "event": "WRITE",
+      "method": "writer",
+      "point": "event:dc28be3da118d4360824c4b3106f34c37947ed28e03dceba4161d6b5a79e7c48",
+      "subject": "shared",
+      "subject_from": "",
+      "matched_name": "shared",
+      "source": "src/t.c:3-3"
+    },
+    {
+      "event": "RETURN",
+      "method": "reader",
+      "point": "event:f7a234f0b5def3b460f2b6149f52e6a572f7e5ca0dab3849bdc8082aa0113133",
+      "subject": "shared",
+      "subject_from": "return",
+      "matched_name": "return_statement",
+      "source": "src/t.c:4-4"
+    }
+  ],
+  "uncertain_facts": [
+    {
+      "fact": "MAY_PARALLEL",
+      "status": "ambiguous",
+      "decisive": true,
+      "detail": "the repository starts threads somewhere, so neither method is ordered"
+    },
+    {
+      "fact": "PROTECTED_BY",
+      "status": "ambiguous",
+      "decisive": true,
+      "method": "reader",
+      "lock": "",
+      "detail": "shared producer reports no exact common held lock"
+    },
+    {
+      "fact": "PROTECTED_BY",
+      "status": "ambiguous",
+      "decisive": true,
+      "method": "writer",
+      "lock": "",
+      "detail": "shared producer reports no exact common held lock"
+    },
+    {
+      "fact": "ACCESS_KIND",
+      "status": "ambiguous",
+      "decisive": true,
+      "detail": "access kind from READ/WRITE events: read vs write"
+    }
+  ],
+  "paths": [],
+  "source_evidence": [
+    "src/t.c:4-4",
+    "src/t.c:3-3"
+  ],
+  "missing_evidence": [
+    "whether the two contexts really run concurrently: MAY_PARALLEL is undecidable from spawn points alone",
+    "whether the lock actually guards this variable: holding a lock near an access is not the same as the lock protecting the data",
+    "whether the variable tolerates weak consistency (a statistics counter may be allowed to race by design)"
+  ],
+  "metadata": {
+    "methods": [
+      "reader",
+      "writer"
+    ],
+    "anchor_span": {
+      "relative_path": "src/t.c",
+      "start_line": 4,
+      "end_line": 4
+    },
+    "exit_point": "",
+    "access_kinds": {
+      "symbol:25b4faa79573579045891be23bf7e040debaa6fde72f613fbd2337eb352740e6": "read",
+      "symbol:c7d08729d22d3b497a8cf61d277b995305799adcf4aa95a30f343552f6bcfdaf": "write"
+    },
+    "access": {
+      "symbol:25b4faa79573579045891be23bf7e040debaa6fde72f613fbd2337eb352740e6": {
+        "kind": "read",
+        "decided": true,
+        "writer_event": "",
+        "reader_event": "event:b40801f937820c26dab6e86266b9ce61787f0b6c2ee45a5ed25cbac9a6eaf54d"
+      },
+      "symbol:c7d08729d22d3b497a8cf61d277b995305799adcf4aa95a30f343552f6bcfdaf": {
+        "kind": "write",
+        "decided": true,
+        "writer_event": "event:dc28be3da118d4360824c4b3106f34c37947ed28e03dceba4161d6b5a79e7c48",
+        "reader_event": ""
+      }
+    }
+  },
+  "evidence_id": "E-DEFECT-4e1cad3afc2ae5f2c6349606",
+  "related_accesses": [
+    {
+      "event_id": "event:b40801f937820c26dab6e86266b9ce61787f0b6c2ee45a5ed25cbac9a6eaf54d",
+      "event_type": "READ",
+      "access_kind": "READ",
+      "is_write": "false",
+      "owner": "reader",
+      "owner_symbol_id": "symbol:25b4faa79573579045891be23bf7e040debaa6fde72f613fbd2337eb352740e6",
+      "relative_path": "src/t.c",
+      "file_id": "file:8957eaddb86c7b38701a9b989cea409a609d2d4519ebf3736355e41b0b031d9a",
+      "start_line": 4,
+      "end_line": 4
+    },
+    {
+      "event_id": "event:dc28be3da118d4360824c4b3106f34c37947ed28e03dceba4161d6b5a79e7c48",
+      "event_type": "WRITE",
+      "access_kind": "WRITE",
+      "is_write": "true",
+      "owner": "writer",
+      "owner_symbol_id": "symbol:c7d08729d22d3b497a8cf61d277b995305799adcf4aa95a30f343552f6bcfdaf",
+      "relative_path": "src/t.c",
+      "file_id": "file:8957eaddb86c7b38701a9b989cea409a609d2d4519ebf3736355e41b0b031d9a",
+      "start_line": 3,
+      "end_line": 3
+    }
+  ],
+  "evidence_v2": {
+    "access": [
+      {
+        "access_event_id": "event:dc28be3da118d4360824c4b3106f34c37947ed28e03dceba4161d6b5a79e7c48",
+        "event_type": "WRITE",
+        "access_kind": "WRITE",
+        "is_write": true,
+        "owner": "writer",
+        "owner_symbol_id": "symbol:c7d08729d22d3b497a8cf61d277b995305799adcf4aa95a30f343552f6bcfdaf",
+        "file": "src/t.c",
+        "source_span": [
+          3,
+          3
+        ]
+      },
+      {
+        "access_event_id": "event:b40801f937820c26dab6e86266b9ce61787f0b6c2ee45a5ed25cbac9a6eaf54d",
+        "event_type": "READ",
+        "access_kind": "READ",
+        "is_write": false,
+        "owner": "reader",
+        "owner_symbol_id": "symbol:25b4faa79573579045891be23bf7e040debaa6fde72f613fbd2337eb352740e6",
+        "file": "src/t.c",
+        "source_span": [
+          4,
+          4
+        ]
+      }
+    ],
+    "lock": {
+      "access_locksets": [
+        {
+          "access_event_id": "event:b40801f937820c26dab6e86266b9ce61787f0b6c2ee45a5ed25cbac9a6eaf54d",
+          "event_type": "READ",
+          "owner": "reader",
+          "owner_symbol_id": "symbol:25b4faa79573579045891be23bf7e040debaa6fde72f613fbd2337eb352740e6",
+          "subject": "shared",
+          "subject_decl": "global:shared",
+          "start_line": 4,
+          "end_line": 4,
+          "held_locks": [],
+          "limitation": [],
+          "candidate_state": "ambiguous"
+        },
+        {
+          "access_event_id": "event:dc28be3da118d4360824c4b3106f34c37947ed28e03dceba4161d6b5a79e7c48",
+          "event_type": "WRITE",
+          "owner": "writer",
+          "owner_symbol_id": "symbol:c7d08729d22d3b497a8cf61d277b995305799adcf4aa95a30f343552f6bcfdaf",
+          "subject": "shared",
+          "subject_decl": "global:shared",
+          "start_line": 3,
+          "end_line": 3,
+          "held_locks": [],
+          "limitation": [],
+          "candidate_state": "ambiguous"
+        }
+      ],
+      "relations": [
+        {
+          "relation": "DIFFERENT_LOCK",
+          "subject": "global:shared",
+          "subject_decl": "global:shared",
+          "access_event_ids": [
+            "event:dc28be3da118d4360824c4b3106f34c37947ed28e03dceba4161d6b5a79e7c48",
+            "event:b40801f937820c26dab6e86266b9ce61787f0b6c2ee45a5ed25cbac9a6eaf54d"
+          ],
+          "owners": [
+            "reader",
+            "writer"
+          ],
+          "unprotected": true
+        }
+      ]
+    },
+    "competing_access": [
+      {
+        "subject": "shared",
+        "identity": "global:shared",
+        "same_storage": "true",
+        "at_least_one_write": true,
+        "may_execute_concurrently": true,
+        "common_lock": false,
+        "different_lock": true,
+        "unprotected": true,
+        "confidence": 0.5,
+        "candidate_state": "ambiguous",
+        "accesses": [
+          {
+            "access_event_id": "event:dc28be3da118d4360824c4b3106f34c37947ed28e03dceba4161d6b5a79e7c48",
+            "event_type": "WRITE",
+            "access_kind": "WRITE",
+            "is_write": true,
+            "owner": "writer",
+            "start_line": 3,
+            "source_span": [
+              3,
+              3
+            ],
+            "held_locks": []
+          },
+          {
+            "access_event_id": "event:b40801f937820c26dab6e86266b9ce61787f0b6c2ee45a5ed25cbac9a6eaf54d",
+            "event_type": "READ",
+            "access_kind": "READ",
+            "is_write": false,
+            "owner": "reader",
+            "start_line": 4,
+            "source_span": [
+              4,
+              4
+            ],
+            "held_locks": []
+          }
+        ]
+      }
+    ],
+    "trace_evidence": [],
+    "confidence_limitation": {
+      "analysis_kind": "may",
+      "confidence": 0.5,
+      "may_be_false_positive": true,
+      "limitations": [
+        "trace_evidence_unavailable",
+        "whether the lock actually guards this variable: holding a lock near an access is not the same as the lock protecting the data",
+        "whether the two contexts really run concurrently: MAY_PARALLEL is undecidable from spawn points alone",
+        "whether the variable tolerates weak consistency (a statistics counter may be allowed to race by design)"
+      ]
+    }
+  }
+}

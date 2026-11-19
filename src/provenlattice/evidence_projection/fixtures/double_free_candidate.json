@@ -1,0 +1,114 @@
+{
+  "defect_key": "4.2",
+  "query": "double_free",
+  "subject": {
+    "kind": "release",
+    "name": "p",
+    "identity": "symbol:ed3746e7a3ce167a2a79e2850036ff33ac9aea697d28904e9c156d7f3d9c56f3#local:p",
+    "storage": "local",
+    "type": "char",
+    "member": "",
+    "method": "df_pos",
+    "owner_symbol_id": "symbol:ed3746e7a3ce167a2a79e2850036ff33ac9aea697d28904e9c156d7f3d9c56f3"
+  },
+  "anchor": "event:4a3427553eb88ed9815c5f2c4bc8c1ede0a49163a4dc401d4c9d75bb94eaaf3d",
+  "discriminator": "symbol:ed3746e7a3ce167a2a79e2850036ff33ac9aea697d28904e9c156d7f3d9c56f3#local:p|symbol:ed3746e7a3ce167a2a79e2850036ff33ac9aea697d28904e9c156d7f3d9c56f3|RELEASE:0|RELEASE:1",
+  "resolution_status": "resolved",
+  "confidence": 0.5,
+  "facts": [
+    {
+      "event": "RELEASE",
+      "method": "df_pos",
+      "point": "event:5c146af2b674c53e24bdc2a89b213815f025c6e4329c8b0699658ee298da4007",
+      "subject": "p",
+      "subject_from": "argument",
+      "matched_name": "free",
+      "source": "src/t.c:5-5"
+    },
+    {
+      "event": "RELEASE",
+      "method": "df_pos",
+      "point": "event:4a3427553eb88ed9815c5f2c4bc8c1ede0a49163a4dc401d4c9d75bb94eaaf3d",
+      "subject": "p",
+      "subject_from": "argument",
+      "matched_name": "free",
+      "source": "src/t.c:6-6"
+    }
+  ],
+  "uncertain_facts": [],
+  "paths": [
+    {
+      "points": [
+        "event:5c146af2b674c53e24bdc2a89b213815f025c6e4329c8b0699658ee298da4007",
+        "event:f6904543b18c078192a602977ae679ce854b9a13ac45e58da9ca6b2815699aba",
+        "event:4a3427553eb88ed9815c5f2c4bc8c1ede0a49163a4dc401d4c9d75bb94eaaf3d"
+      ],
+      "types": [
+        "RELEASE",
+        "CALL",
+        "RELEASE"
+      ],
+      "edges": [
+        "semantic_edge:c63481aa349624e7a2539ae0e9eae113de2bd68976cfb7e5fe09bf24de7b88cb",
+        "semantic_edge:5127139620adafdb9c02f915394a040add6f9d9d9b316252a1bd9711ce9bfde0"
+      ]
+    }
+  ],
+  "source_evidence": [
+    "src/t.c:5-5",
+    "src/t.c:6-6"
+  ],
+  "missing_evidence": [
+    "the repository's release convention: whether a release leaves the pointer dangling or nulls it, which decides whether the second release is a double free or a legal `free(NULL)`",
+    "whether two names really address one object: the alias annotation is a same-statement copy fact, so a pair joined through it is a candidate and not an identity",
+    "the noreturn conventions the graph does not hold: an arm that ends in `abort`, `assert`, or a project's own failure macro does not return, so it cannot reach what follows the branch -- the graph holds the control flow and not the call's calling convention, and the arm reads as falling through, which leaves two mutually exclusive arms looking both reachable"
+  ],
+  "metadata": {
+    "first_release": {
+      "point": "event:5c146af2b674c53e24bdc2a89b213815f025c6e4329c8b0699658ee298da4007",
+      "source": "src/t.c:5-5",
+      "subject": "p",
+      "declared": true
+    },
+    "second_release": {
+      "point": "event:4a3427553eb88ed9815c5f2c4bc8c1ede0a49163a4dc401d4c9d75bb94eaaf3d",
+      "source": "src/t.c:6-6",
+      "subject": "p",
+      "declared": true
+    },
+    "reach": "reachable",
+    "path_recorded": true,
+    "paths_truncated": false,
+    "anchor_span": {
+      "relative_path": "src/t.c",
+      "start_line": 6,
+      "end_line": 6
+    },
+    "methods": [
+      "df_pos"
+    ],
+    "exit_point": ""
+  },
+  "evidence_id": "E-DEFECT-e1b27d69072cca133026115f",
+  "evidence_v2": {
+    "access": [],
+    "lock": {
+      "access_locksets": [],
+      "relations": []
+    },
+    "competing_access": [],
+    "trace_evidence": [],
+    "confidence_limitation": {
+      "analysis_kind": "may",
+      "confidence": 0.5,
+      "may_be_false_positive": true,
+      "limitations": [
+        "lock_facts_unavailable",
+        "the noreturn conventions the graph does not hold: an arm that ends in `abort`, `assert`, or a project's own failure macro does not return, so it cannot reach what follows the branch -- the graph holds the control flow and not the call's calling convention, and the arm reads as falling through, which leaves two mutually exclusive arms looking both reachable",
+        "the repository's release convention: whether a release leaves the pointer dangling or nulls it, which decides whether the second release is a double free or a legal `free(NULL)`",
+        "trace_evidence_unavailable",
+        "whether two names really address one object: the alias annotation is a same-statement copy fact, so a pair joined through it is a candidate and not an identity"
+      ]
+    }
+  }
+}

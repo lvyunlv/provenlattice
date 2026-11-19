@@ -1,0 +1,188 @@
+{
+  "adapter_version": "provenlattice-evidence-projection-v1",
+  "api_version": "v1.1",
+  "contract_version": "skill-graph-factbundle-contract-v2.1",
+  "core_adapter_version": "",
+  "defect_type": "double_free",
+  "error": null,
+  "evidence_locations": [
+    {
+      "access_rows": [],
+      "candidate_key": "E-DEFECT-e1b27d69072cca133026115f",
+      "defect_key": "4.2",
+      "discriminator": "symbol:ed3746e7a3ce167a2a79e2850036ff33ac9aea697d28904e9c156d7f3d9c56f3#local:p|symbol:ed3746e7a3ce167a2a79e2850036ff33ac9aea697d28904e9c156d7f3d9c56f3|RELEASE:0|RELEASE:1",
+      "evidence_id": "E-DEFECT-e1b27d69072cca133026115f",
+      "identity": "symbol:ed3746e7a3ce167a2a79e2850036ff33ac9aea697d28904e9c156d7f3d9c56f3#local:p",
+      "primary_anchor": {
+        "file": "src/t.c",
+        "line": 6,
+        "line_span": [
+          6,
+          6
+        ],
+        "provenance": "candidate.metadata.anchor_span"
+      },
+      "release_sites": [
+        {
+          "access_type": "RELEASE",
+          "anchor_class": "supporting",
+          "candidate_key": "E-DEFECT-e1b27d69072cca133026115f",
+          "event_id": "event:5c146af2b674c53e24bdc2a89b213815f025c6e4329c8b0699658ee298da4007",
+          "file": "src/t.c",
+          "held_locks": [],
+          "line": 5,
+          "line_span": [
+            5,
+            5
+          ],
+          "owner": "df_pos",
+          "provenance": "candidate.facts[RELEASE].source",
+          "role": "release_sites",
+          "semantic_role": "release_site",
+          "source_fact_id": "event:5c146af2b674c53e24bdc2a89b213815f025c6e4329c8b0699658ee298da4007"
+        },
+        {
+          "access_type": "RELEASE",
+          "anchor_class": "supporting",
+          "candidate_key": "E-DEFECT-e1b27d69072cca133026115f",
+          "event_id": "event:4a3427553eb88ed9815c5f2c4bc8c1ede0a49163a4dc401d4c9d75bb94eaaf3d",
+          "file": "src/t.c",
+          "held_locks": [],
+          "line": 6,
+          "line_span": [
+            6,
+            6
+          ],
+          "owner": "df_pos",
+          "provenance": "candidate.facts[RELEASE].source",
+          "role": "release_sites",
+          "semantic_role": "release_site",
+          "source_fact_id": "event:4a3427553eb88ed9815c5f2c4bc8c1ede0a49163a4dc401d4c9d75bb94eaaf3d"
+        }
+      ],
+      "subject": "p"
+    }
+  ],
+  "facts": {
+    "release_sites": {
+      "value": [
+        {
+          "candidate_key": "E-DEFECT-e1b27d69072cca133026115f",
+          "defect_key": "4.2",
+          "discriminator": "symbol:ed3746e7a3ce167a2a79e2850036ff33ac9aea697d28904e9c156d7f3d9c56f3#local:p|symbol:ed3746e7a3ce167a2a79e2850036ff33ac9aea697d28904e9c156d7f3d9c56f3|RELEASE:0|RELEASE:1",
+          "evidence_id": "E-DEFECT-e1b27d69072cca133026115f",
+          "identity": "symbol:ed3746e7a3ce167a2a79e2850036ff33ac9aea697d28904e9c156d7f3d9c56f3#local:p",
+          "primary_anchor": {
+            "file": "src/t.c",
+            "line": 6,
+            "line_span": [
+              6,
+              6
+            ],
+            "provenance": "candidate.metadata.anchor_span"
+          },
+          "release_sites": [
+            {
+              "access_type": "RELEASE",
+              "anchor_class": "supporting",
+              "candidate_key": "E-DEFECT-e1b27d69072cca133026115f",
+              "event_id": "event:5c146af2b674c53e24bdc2a89b213815f025c6e4329c8b0699658ee298da4007",
+              "file": "src/t.c",
+              "held_locks": [],
+              "line": 5,
+              "line_span": [
+                5,
+                5
+              ],
+              "owner": "df_pos",
+              "provenance": "candidate.facts[RELEASE].source",
+              "role": "release_sites",
+              "semantic_role": "release_site",
+              "source_fact_id": "event:5c146af2b674c53e24bdc2a89b213815f025c6e4329c8b0699658ee298da4007"
+            },
+            {
+              "access_type": "RELEASE",
+              "anchor_class": "supporting",
+              "candidate_key": "E-DEFECT-e1b27d69072cca133026115f",
+              "event_id": "event:4a3427553eb88ed9815c5f2c4bc8c1ede0a49163a4dc401d4c9d75bb94eaaf3d",
+              "file": "src/t.c",
+              "held_locks": [],
+              "line": 6,
+              "line_span": [
+                6,
+                6
+              ],
+              "owner": "df_pos",
+              "provenance": "candidate.facts[RELEASE].source",
+              "role": "release_sites",
+              "semantic_role": "release_site",
+              "source_fact_id": "event:4a3427553eb88ed9815c5f2c4bc8c1ede0a49163a4dc401d4c9d75bb94eaaf3d"
+            }
+          ],
+          "subject": "p"
+        }
+      ]
+    }
+  },
+  "location_coverage": {
+    "by_semantic_role": {
+      "candidate_anchor": 1,
+      "racing_access": 0,
+      "release_site": 2
+    },
+    "candidates": 1,
+    "unlocated_candidates": [],
+    "with_access_locations": 0,
+    "with_primary_anchor": 1,
+    "with_support_locations": 1
+  },
+  "projection_version": "factbundle-projection-v2.1",
+  "reason": null,
+  "request": {
+    "case_workdir": "C:\\Users\\sunqinghw\\AppData\\Local\\Temp\\tmp69m_ypjp\\repo",
+    "database": "C:\\Users\\sunqinghw\\AppData\\Local\\Temp\\tmp69m_ypjp\\graph.db",
+    "defect_type": "double_free",
+    "entry": "analyze_double_free",
+    "target_symbols": []
+  },
+  "schema_version": "2.1",
+  "status": "ok",
+  "supporting_locations": [
+    {
+      "access_type": "RELEASE",
+      "anchor_class": "supporting",
+      "candidate_key": "E-DEFECT-e1b27d69072cca133026115f",
+      "event_id": "event:5c146af2b674c53e24bdc2a89b213815f025c6e4329c8b0699658ee298da4007",
+      "file": "src/t.c",
+      "held_locks": [],
+      "line": 5,
+      "line_span": [
+        5,
+        5
+      ],
+      "owner": "df_pos",
+      "provenance": "candidate.facts[RELEASE].source",
+      "role": "release_sites",
+      "semantic_role": "release_site",
+      "source_fact_id": "event:5c146af2b674c53e24bdc2a89b213815f025c6e4329c8b0699658ee298da4007"
+    },
+    {
+      "access_type": "RELEASE",
+      "anchor_class": "supporting",
+      "candidate_key": "E-DEFECT-e1b27d69072cca133026115f",
+      "event_id": "event:4a3427553eb88ed9815c5f2c4bc8c1ede0a49163a4dc401d4c9d75bb94eaaf3d",
+      "file": "src/t.c",
+      "held_locks": [],
+      "line": 6,
+      "line_span": [
+        6,
+        6
+      ],
+      "owner": "df_pos",
+      "provenance": "candidate.facts[RELEASE].source",
+      "role": "release_sites",
+      "semantic_role": "release_site",
+      "source_fact_id": "event:4a3427553eb88ed9815c5f2c4bc8c1ede0a49163a4dc401d4c9d75bb94eaaf3d"
+    }
+  ]
+}

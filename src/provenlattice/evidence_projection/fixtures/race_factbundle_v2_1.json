@@ -1,0 +1,218 @@
+{
+  "adapter_version": "provenlattice-evidence-projection-v1",
+  "api_version": "v1.1",
+  "contract_version": "skill-graph-factbundle-contract-v2.1",
+  "core_adapter_version": "",
+  "defect_type": "race_condition",
+  "error": null,
+  "evidence_locations": [
+    {
+      "access_rows": [
+        {
+          "access_type": "WRITE",
+          "candidate_key": "E-DEFECT-4e1cad3afc2ae5f2c6349606",
+          "decided": true,
+          "event_id": "event:dc28be3da118d4360824c4b3106f34c37947ed28e03dceba4161d6b5a79e7c48",
+          "file": "src/t.c",
+          "held_locks": [],
+          "kind": "WRITE",
+          "line": 3,
+          "line_span": [
+            3,
+            3
+          ],
+          "method": "writer",
+          "method_symbol_id": "symbol:c7d08729d22d3b497a8cf61d277b995305799adcf4aa95a30f343552f6bcfdaf",
+          "non_atomic": false,
+          "owner": "writer",
+          "owner_symbol_id": "symbol:c7d08729d22d3b497a8cf61d277b995305799adcf4aa95a30f343552f6bcfdaf",
+          "provenance": "candidate.evidence_v2.access",
+          "source_fact_id": "event:dc28be3da118d4360824c4b3106f34c37947ed28e03dceba4161d6b5a79e7c48"
+        },
+        {
+          "access_type": "READ",
+          "candidate_key": "E-DEFECT-4e1cad3afc2ae5f2c6349606",
+          "decided": true,
+          "event_id": "event:b40801f937820c26dab6e86266b9ce61787f0b6c2ee45a5ed25cbac9a6eaf54d",
+          "file": "src/t.c",
+          "held_locks": [],
+          "kind": "READ",
+          "line": 4,
+          "line_span": [
+            4,
+            4
+          ],
+          "method": "reader",
+          "method_symbol_id": "symbol:25b4faa79573579045891be23bf7e040debaa6fde72f613fbd2337eb352740e6",
+          "non_atomic": false,
+          "owner": "reader",
+          "owner_symbol_id": "symbol:25b4faa79573579045891be23bf7e040debaa6fde72f613fbd2337eb352740e6",
+          "provenance": "candidate.evidence_v2.access",
+          "source_fact_id": "event:b40801f937820c26dab6e86266b9ce61787f0b6c2ee45a5ed25cbac9a6eaf54d"
+        }
+      ],
+      "candidate_key": "E-DEFECT-4e1cad3afc2ae5f2c6349606",
+      "defect_key": "1.1",
+      "discriminator": "global:shared|symbol:25b4faa79573579045891be23bf7e040debaa6fde72f613fbd2337eb352740e6|symbol:c7d08729d22d3b497a8cf61d277b995305799adcf4aa95a30f343552f6bcfdaf",
+      "evidence_id": "E-DEFECT-4e1cad3afc2ae5f2c6349606",
+      "identity": "global:shared",
+      "primary_anchor": {
+        "file": "src/t.c",
+        "line": 4,
+        "line_span": [
+          4,
+          4
+        ],
+        "provenance": "candidate.metadata.anchor_span"
+      },
+      "release_sites": [],
+      "subject": "shared"
+    }
+  ],
+  "facts": {
+    "shared_accesses": {
+      "value": [
+        {
+          "access_rows": [
+            {
+              "access_type": "WRITE",
+              "candidate_key": "E-DEFECT-4e1cad3afc2ae5f2c6349606",
+              "decided": true,
+              "event_id": "event:dc28be3da118d4360824c4b3106f34c37947ed28e03dceba4161d6b5a79e7c48",
+              "file": "src/t.c",
+              "held_locks": [],
+              "kind": "WRITE",
+              "line": 3,
+              "line_span": [
+                3,
+                3
+              ],
+              "method": "writer",
+              "method_symbol_id": "symbol:c7d08729d22d3b497a8cf61d277b995305799adcf4aa95a30f343552f6bcfdaf",
+              "non_atomic": false,
+              "owner": "writer",
+              "owner_symbol_id": "symbol:c7d08729d22d3b497a8cf61d277b995305799adcf4aa95a30f343552f6bcfdaf",
+              "provenance": "candidate.evidence_v2.access",
+              "source_fact_id": "event:dc28be3da118d4360824c4b3106f34c37947ed28e03dceba4161d6b5a79e7c48"
+            },
+            {
+              "access_type": "READ",
+              "candidate_key": "E-DEFECT-4e1cad3afc2ae5f2c6349606",
+              "decided": true,
+              "event_id": "event:b40801f937820c26dab6e86266b9ce61787f0b6c2ee45a5ed25cbac9a6eaf54d",
+              "file": "src/t.c",
+              "held_locks": [],
+              "kind": "READ",
+              "line": 4,
+              "line_span": [
+                4,
+                4
+              ],
+              "method": "reader",
+              "method_symbol_id": "symbol:25b4faa79573579045891be23bf7e040debaa6fde72f613fbd2337eb352740e6",
+              "non_atomic": false,
+              "owner": "reader",
+              "owner_symbol_id": "symbol:25b4faa79573579045891be23bf7e040debaa6fde72f613fbd2337eb352740e6",
+              "provenance": "candidate.evidence_v2.access",
+              "source_fact_id": "event:b40801f937820c26dab6e86266b9ce61787f0b6c2ee45a5ed25cbac9a6eaf54d"
+            }
+          ],
+          "candidate_key": "E-DEFECT-4e1cad3afc2ae5f2c6349606",
+          "defect_key": "1.1",
+          "discriminator": "global:shared|symbol:25b4faa79573579045891be23bf7e040debaa6fde72f613fbd2337eb352740e6|symbol:c7d08729d22d3b497a8cf61d277b995305799adcf4aa95a30f343552f6bcfdaf",
+          "evidence_id": "E-DEFECT-4e1cad3afc2ae5f2c6349606",
+          "identity": "global:shared",
+          "primary_anchor": {
+            "file": "src/t.c",
+            "line": 4,
+            "line_span": [
+              4,
+              4
+            ],
+            "provenance": "candidate.metadata.anchor_span"
+          },
+          "subject": "shared"
+        }
+      ]
+    }
+  },
+  "location_coverage": {
+    "by_semantic_role": {
+      "candidate_anchor": 1,
+      "racing_access": 2,
+      "release_site": 0
+    },
+    "candidates": 1,
+    "unlocated_candidates": [],
+    "with_access_locations": 1,
+    "with_primary_anchor": 1,
+    "with_support_locations": 1
+  },
+  "projection_version": "factbundle-projection-v2.1",
+  "reason": null,
+  "request": {
+    "case_workdir": "C:\\Users\\sunqinghw\\AppData\\Local\\Temp\\tmpuacc4_uu\\repo",
+    "database": "C:\\Users\\sunqinghw\\AppData\\Local\\Temp\\tmpuacc4_uu\\graph.db",
+    "defect_type": "race_condition",
+    "entry": "analyze_shared_access",
+    "target_symbols": []
+  },
+  "schema_version": "2.1",
+  "status": "ok",
+  "supporting_locations": [
+    {
+      "access_type": "",
+      "anchor_class": "primary",
+      "candidate_key": "E-DEFECT-4e1cad3afc2ae5f2c6349606",
+      "event_id": "",
+      "file": "src/t.c",
+      "held_locks": [],
+      "line": 4,
+      "line_span": [
+        4,
+        4
+      ],
+      "owner": "",
+      "provenance": "candidate.metadata.anchor_span",
+      "role": "shared_accesses",
+      "semantic_role": "candidate_anchor",
+      "source_fact_id": ""
+    },
+    {
+      "access_type": "WRITE",
+      "anchor_class": "supporting",
+      "candidate_key": "E-DEFECT-4e1cad3afc2ae5f2c6349606",
+      "event_id": "event:dc28be3da118d4360824c4b3106f34c37947ed28e03dceba4161d6b5a79e7c48",
+      "file": "src/t.c",
+      "held_locks": [],
+      "line": 3,
+      "line_span": [
+        3,
+        3
+      ],
+      "owner": "writer",
+      "provenance": "candidate.evidence_v2.access",
+      "role": "shared_accesses",
+      "semantic_role": "racing_access",
+      "source_fact_id": "event:dc28be3da118d4360824c4b3106f34c37947ed28e03dceba4161d6b5a79e7c48"
+    },
+    {
+      "access_type": "READ",
+      "anchor_class": "supporting",
+      "candidate_key": "E-DEFECT-4e1cad3afc2ae5f2c6349606",
+      "event_id": "event:b40801f937820c26dab6e86266b9ce61787f0b6c2ee45a5ed25cbac9a6eaf54d",
+      "file": "src/t.c",
+      "held_locks": [],
+      "line": 4,
+      "line_span": [
+        4,
+        4
+      ],
+      "owner": "reader",
+      "provenance": "candidate.evidence_v2.access",
+      "role": "shared_accesses",
+      "semantic_role": "racing_access",
+      "source_fact_id": "event:b40801f937820c26dab6e86266b9ce61787f0b6c2ee45a5ed25cbac9a6eaf54d"
+    }
+  ]
+}
