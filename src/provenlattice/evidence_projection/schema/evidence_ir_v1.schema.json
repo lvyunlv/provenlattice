@@ -1,0 +1,177 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://provenlattice/evidence_projection/schema/evidence_ir_v1.schema.json",
+  "title": "Canonical Evidence IR V1",
+  "description": "Versioned, additive, machine-verifiable unified evidence structure projected from a FactBundle v2.1 (GATE-0). Nine standard blocks (run, candidates, claims, facts, relations, locations, provenance, coverage, limitations) plus a lossless source_envelope (deep copy of the original bundle). ir_schema_version is the IR's own structure version; projection_version / adapter_version belong to the GATE-0 pipeline; projector_version is NOT_APPLICABLE in this phase (no Projector Registry).",
+  "type": "object",
+  "required": [
+    "ir_schema_version",
+    "bundle_status",
+    "run",
+    "candidates",
+    "claims",
+    "facts",
+    "relations",
+    "locations",
+    "provenance",
+    "coverage",
+    "limitations",
+    "source_envelope"
+  ],
+  "properties": {
+    "ir_schema_version": { "const": "1" },
+    "bundle_status": {
+      "type": "string",
+      "enum": ["ok", "partial", "empty", "unsupported_only", "stale", "not_built", "failed", "timeout"]
+    },
+    "run": { "$ref": "#/definitions/run" },
+    "candidates": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/candidate" }
+    },
+    "claims": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/claim" }
+    },
+    "facts": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/fact" }
+    },
+    "relations": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/relation" }
+    },
+    "locations": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/location" }
+    },
+    "provenance": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/provenanceRecord" }
+    },
+    "coverage": { "$ref": "#/definitions/coverage" },
+    "limitations": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "source_envelope": {
+      "type": "object",
+      "description": "Deep copy of the original FactBundle v2.1 (lossless fallback, C1). No normalisation / reorder / type coercion; JSON value-level faithful."
+    }
+  },
+  "definitions": {
+    "run": {
+      "type": "object",
+      "required": [
+        "code_revision", "engine_version", "db_snapshot_identity",
+        "source_schema_version", "contract_version", "projection_version",
+        "adapter_version", "core_adapter_version", "projector_version",
+        "query_params", "error", "reason"
+      ],
+      "properties": {
+        "code_revision": { "type": "string", "minLength": 1 },
+        "engine_version": { "type": "string", "minLength": 1 },
+        "db_snapshot_identity": { "type": "string", "minLength": 1 },
+        "source_schema_version": { "type": "string", "minLength": 1 },
+        "contract_version": { "type": "string", "minLength": 1 },
+        "projection_version": { "type": "string", "minLength": 1 },
+        "adapter_version": { "type": "string", "minLength": 1 },
+        "core_adapter_version": { "type": "string" },
+        "projector_version": { "const": "NOT_APPLICABLE" },
+        "query_params": { "type": "object" },
+        "error": { "type": ["string", "null"] },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "required": ["id", "defect_type", "identity", "subject", "primary_anchor"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "description": "Verbatim GATE-0 candidate_key (C5); never recomputed." },
+        "defect_type": { "type": "string" },
+        "evidence_id": { "type": "string" },
+        "defect_key": { "type": "string" },
+        "discriminator": { "type": "string" },
+        "identity": { "type": "string" },
+        "subject": { "type": "string" },
+        "primary_anchor": { "$ref": "#/definitions/anchor" }
+      }
+    },
+    "claim": {
+      "type": "object",
+      "required": ["claim", "status"],
+      "properties": {
+        "claim": { "type": "string", "minLength": 1 },
+        "status": { "type": "string", "enum": ["SUPPORTED", "UNSUPPORTED", "UNKNOWN", "PARTIAL"] }
+      }
+    },
+    "fact": {
+      "type": "object",
+      "required": ["fact_id", "type", "candidate_id", "file", "line", "line_span", "provenance"],
+      "properties": {
+        "fact_id": { "type": "string", "description": "Real engine fact/event id; empty string marks an explicit degradation." },
+        "type": { "type": "string" },
+        "candidate_id": { "type": "string", "minLength": 1 },
+        "file": { "type": "string" },
+        "line": { "type": "integer" },
+        "line_span": { "type": "array", "items": { "type": "integer" } },
+        "provenance": { "type": "string" }
+      }
+    },
+    "relation": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "type": "string", "enum": ["READS", "WRITES", "FREES", "FLOWS_TO", "GUARDED_BY", "HAPPENS_BEFORE"] }
+      }
+    },
+    "location": {
+      "type": "object",
+      "required": ["candidate_id", "file", "line", "semantic_role", "anchor_class", "provenance"],
+      "properties": {
+        "candidate_id": { "type": "string", "minLength": 1 },
+        "file": { "type": "string" },
+        "line": { "type": "integer" },
+        "line_span": { "type": "array", "items": { "type": "integer" } },
+        "owner": { "type": "string" },
+        "role": { "type": "string" },
+        "semantic_role": { "type": "string" },
+        "anchor_class": { "type": "string" },
+        "source_fact_id": { "type": "string" },
+        "event_id": { "type": "string" },
+        "provenance": { "type": "string" }
+      }
+    },
+    "provenanceRecord": {
+      "type": "object",
+      "required": ["fact_id", "candidate_id", "origin", "projection_version", "adapter_version", "contract_version"],
+      "properties": {
+        "fact_id": { "type": "string" },
+        "candidate_id": { "type": "string", "minLength": 1 },
+        "origin": { "type": "string" },
+        "projection_version": { "type": "string" },
+        "adapter_version": { "type": "string" },
+        "contract_version": { "type": "string" }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "required": ["source_location"],
+      "properties": {
+        "source_location": {
+          "type": "object",
+          "description": "The GATE-0 location_coverage verbatim; the only coverage dimension mapped (C4)."
+        }
+      }
+    },
+    "anchor": {
+      "type": ["object", "null"],
+      "properties": {
+        "file": { "type": "string" },
+        "line": { "type": "integer" },
+        "line_span": { "type": "array", "items": { "type": "integer" } },
+        "provenance": { "type": "string" }
+      }
+    }
+  }
+}
