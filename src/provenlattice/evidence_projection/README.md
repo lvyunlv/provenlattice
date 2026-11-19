@@ -6,19 +6,21 @@ chain (`query_defect` → evidence projection → FactBundle v2.1 binding +
 validation) for exactly two defect types. Issue #79 adds, additively and
 separately, the **Canonical Evidence IR V1** (`ir.py`) that projects a
 FactBundle v2.1 into a versioned, machine-verifiable unified evidence structure.
-It deliberately does **not** build the Projector Registry, multi-defect
-extension, or the five-interface Agent/Skill API (those are later phases,
-authorised separately).
+Issue #83 adds, additively, the **Projector Registry V1** (`registry.py`) that
+wires the two GATE-0 projectors into one unified, fail-closed mechanism. It
+deliberately does **not** build the multi-defect extension or the five-interface
+Agent/Skill API (those are later phases, authorised separately).
 
 ## Scope
 
-| Authorised (GATE-0 + #79)                              | NOT authorised (later phases) |
+| Authorised (GATE-0 + #79 + #83)                        | NOT authorised (later phases) |
 | ------------------------------------------------------ | ----------------------------- |
-| `analyze_shared_access` (Race Condition)               | Projector Registry            |
-| `analyze_double_free` (Double Free)                    | multi-defect extension        |
-| FactBundle v2.1 compatible envelope + validation       | Agent / Skill API             |
-| Candidate ↔ Evidence binding proof                      | Skill-consumer integration    |
+| `analyze_shared_access` (Race Condition)               | multi-defect extension        |
+| `analyze_double_free` (Double Free)                    | Agent / Skill API             |
+| FactBundle v2.1 compatible envelope + validation       | Skill-consumer integration    |
+| Candidate ↔ Evidence binding proof                      | real 3rd-defect production    |
 | Canonical Evidence IR V1 (`ir.py`, Issue #79)          |                               |
+| Projector Registry V1 (`registry.py`, Issue #83)       |                               |
 | `schema/`, `fixtures/`, this README, `tests/`          |                               |
 
 The implementation lives **only** under
@@ -40,6 +42,9 @@ release/version/tag is modified.
 * `ir.py` — Canonical Evidence IR V1 (Issue #79): `factbundle_v2_1_to_ir` +
   `validate_evidence_ir_v1` + the 9-block + `source_envelope` mapping. Pure and
   engine-free.
+* `registry.py` — Projector Registry V1 (Issue #83): `Projector` protocol +
+  `Registry` + production `REGISTRY`, wrapping the two GATE-0 `analyze_*`
+  entries (read-only, fail-closed).
 * `schema/factbundle_v2_1.schema.json` — JSON Schema for the v2.1 envelope.
 * `schema/evidence_ir_v1.schema.json` — JSON Schema for the Canonical Evidence IR V1.
 * `fixtures/` — real captured candidate records + real FactBundle v2.1 bundles.
@@ -201,6 +206,63 @@ never reads the engine / git HEAD / DB, and emits `claims == []` /
 `relations == []`. `validate_evidence_ir_v1` returns a list of problem strings
 (empty == valid) and proves the candidate↔evidence binding plus the M1–M15
 structure. Test coverage lives in `tests/test_evidence_ir.py`.
+
+## Projector Registry V1 (Issue #83)
+
+`registry.py` adds, additively, the **Projector Registry V1** — a unified
+Projector protocol + fail-closed registry that wires the two GATE-0 defect
+projectors (`race_condition` / `double_free`) into one discoverable mechanism.
+It **wraps** the GATE-0 `adapter.analyze_*` entries (read-only reference); it
+never re-projects, never modifies the GATE-0 modules, and never touches the IR
+V1 `ir.py`.
+
+### Protocol + registry
+
+```python
+from provenlattice.evidence_projection import registry
+
+registry.REGISTRY.list_projector_capabilities()
+# -> [{"defect_type": "double_free", "projector_version": "1"},
+#     {"defect_type": "race_condition", "projector_version": "1"}]
+
+bundle = registry.REGISTRY.analyze("race_condition", case_workdir, database)
+```
+
+- `Projector` (Protocol) — `defect_type` + `projector_version` + `analyze(...)`;
+  one implementation == one defect type.
+- `Registry` — instantiable; `register_projector` / `get_projector` /
+  `list_projector_capabilities` / `analyze`. Fail-closed: duplicate
+  `defect_type` → `DuplicateDefectTypeError`; unknown `defect_type` →
+  `UnknownDefectTypeError`; never a silent overwrite and never a placeholder.
+- `REGISTRY` — the production global instance, with the two built-ins
+  pre-registered (`race_condition`, `double_free`).
+
+`AdapterProjector` wraps a GATE-0 `analyze_*` with frozen (read-only) metadata;
+`analyze` forwards `(case_workdir, database, target_symbols, **kwargs)` verbatim
+and returns the FactBundle v2.1 verbatim. The registry is pure forwarding, so
+its output is byte-identical (and SHA-256 equal) to the direct GATE-0 entry.
+
+### Version semantics (E2, tied to #79)
+
+| Field | Layer | Value | Notes |
+| ----- | ----- | ----- | ----- |
+| `projector_version` | Registry mechanism | `"1"` | this module (`PROJECTOR_MECHANISM_VERSION`) |
+| `projection_version` | GATE-0 projection | `factbundle-projection-v2.1` | stamped by `adapter`, never rewritten by the registry |
+| IR `run.projector_version` | IR V1 (frozen) | `NOT_APPLICABLE` | `ir.py` unchanged; the registry does not write it |
+
+The registry's `projector_version` is independent metadata; it is not written
+into, and does not overwrite, the IR V1 `run.projector_version`. Writing a
+registry projector identity into the IR would be a separate IR upgrade
+(additive field / IR V2), out of scope for this phase.
+
+### Dependency closure
+
+`registry.py` imports only `adapter` (to wrap the two GATE-0 entries) and
+`constants` (for the `defect_type` mapping); it never imports `ir.py`, the
+engine, GT, Prompt, Skill or Scorer. The test-only third projector is
+registered on an independent `Registry()` and never enters the production
+`REGISTRY` or the FactBundle `defect_type` schema enum. Test coverage lives in
+`tests/test_evidence_registry.py`.
 
 ## Testing
 
