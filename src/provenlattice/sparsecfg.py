@@ -341,8 +341,11 @@ class SparseCfgBuilder:
 
         `declarations` is a parsing.declarations.DeclarationIndex, or None when
         the language has none (Python today). It is handed in rather than built
-        here because this class consumes facts and does not produce them: the
-        same reason `owners` is handed in.
+        here because the index is shared with the other semantic consumers.
+        The V1 array-extent map is the one bounded exception: declaration
+        dimensions are not yet an index fact, so `build` reads that syntax from
+        the same tree and joins it back by the declaration's exact `(start_byte,
+        name)` identity.
 
         `out_param` is the vocabulary's list of allocation callees that hand
         the pointer back through their first argument, as last name
@@ -356,6 +359,24 @@ class SparseCfgBuilder:
         self.profile = profile
         self.declarations = declarations
         self._out_param = frozenset(out_param)
+        # `(declaration node start, declared name)` -> array extent fact. Built
+        # once from the root in `build`, never keyed by a use-site name alone.
+        self._array_extents: dict[tuple[int, str], dict[str, Any]] = {}
+        # Direct array declarator identity, including array-adjusted parameters.
+        # Unlike extents, this syntax set is also used only to orient subscripts.
+        self._array_declaration_keys: set[tuple[int, str]] = set()
+        # Exact declaration/type syntax for V1's one-level member type evidence.
+        # Declaration.type_token is deliberately shallow and must never select a
+        # same-spelled class or tag by itself.
+        self._value_declaration_types: dict[tuple[int, str], Any] = {}
+        self._value_type_definitions: list[Any] = []
+        self._value_type_aliases: set[str] = set()
+        # Statement headings are lexical scopes too, but DeclarationIndex
+        # intentionally owns only compound/function/class scopes. These V1-only
+        # maps skip stale heading declarations and recognize unindexed range-for
+        # shadows without changing the index's global semantics.
+        self._statement_declaration_scopes: dict[int, Any] = {}
+        self._statement_declaration_names: dict[int, dict[str, int]] = {}
         # The hits grouped by the span of the node that produced them. Two
         # events share one span when one node matches two event types
         # (`free(p)` is both CALL and RELEASE); they chain in type order.
@@ -399,6 +420,17 @@ class SparseCfgBuilder:
     # entry points
 
     def build(self, root: Any) -> ParsedCfg:
+        (
+            self._array_extents,
+            self._array_declaration_keys,
+            self._value_declaration_types,
+            self._value_type_definitions,
+            self._value_type_aliases,
+        ) = _collect_array_extents(root, self.source)
+        (
+            self._statement_declaration_scopes,
+            self._statement_declaration_names,
+        ) = _collect_statement_declaration_scopes(root, self.source)
         spans = {(span.start_byte, span.end_byte): span for span in self.owners.spans}
         nodes_by_span: dict[tuple[int, int], Any] = {}
         self._collect(root, spans, nodes_by_span)
@@ -928,6 +960,24 @@ class SparseCfgBuilder:
                 annotations["passed_to"] = passed_to
             if returned:
                 annotations["returned"] = "true"
+            extent = _alloc_extent_facts(node, event.matched_name, self.source)
+            # A CALL argument is not the object returned by an allocator. Keep
+            # the legacy subject annotations untouched, but never copy the `n`
+            # in an unbound `malloc(n)` into the new allocation-object fact.
+            extent["object"] = _allocation_object_fact(
+                annotations,
+                node,
+                out_argument_is_direct=self._allocation_out_argument_is_direct(node),
+                allow_comma=self.profile.name != "cpp",
+                assignment_target_is_pointer=self._allocation_assignment_target_is_pointer,
+                cpp=self.profile.name == "cpp",
+            )
+            annotations[BUFFER_EXTENT_KEY] = _facts_json(extent)
+        elif event_type == "CALL":
+            access = _memory_call_facts(node, event.matched_name, self.source)
+            if access is not None:
+                access["object"] = self._memory_call_object_fact(node)
+                annotations[MEMORY_ACCESS_KEY] = _facts_json(access)
         arguments = _call_arguments(node, self.source)
         if arguments:
             annotations["arguments"] = arguments
@@ -936,6 +986,84 @@ class SparseCfgBuilder:
             annotations["thread_function"] = thread_function
         annotations.update(self._thread_argument_facts(event_type, event.matched_name, node))
         return annotations
+
+    def _direct_builtin_address_of(self, identity: Any) -> bool:
+        """Whether `identity` is built-in `&` of a directly nameable target."""
+        if identity is None or identity.type != "pointer_expression" or (
+            _operator_of(identity, self.source) != "&"
+        ):
+            return False
+        target = _unwrap_parentheses(identity.child_by_field_name("argument"))
+        if self.profile.name == "cpp":
+            # A class/enum may overload unary `&`. Without a class/member type
+            # resolver, only a declared builtin scalar, pointer, or direct array
+            # is sufficient evidence that this is the built-in address operator.
+            if target is None or target.type != "identifier":
+                return False
+            declaration = self._resolve_extent_declaration(
+                target, _text_of(self.source, target)
+            )
+            if declaration is None:
+                return False
+            key = (declaration.start_byte, declaration.name)
+            return (
+                declaration.is_pointer
+                or key in self._array_declaration_keys
+                or declaration.type_token in _CPP_BUILTIN_ADDRESS_OF_TYPES
+            )
+        while target is not None and target.type == "field_expression":
+            target = _unwrap_parentheses(target.child_by_field_name("argument"))
+        return target is not None and target.type in {"identifier", "this"}
+
+    def _allocation_out_argument_is_direct(self, node: Any) -> bool:
+        argument = _unwrap_parentheses(_first_call_argument(node))
+        while argument is not None and argument.type == "cast_expression":
+            argument = _unwrap_parentheses(argument.child_by_field_name("value"))
+        if not self._direct_builtin_address_of(argument):
+            return False
+        target = _unwrap_parentheses(argument.child_by_field_name("argument"))
+        declaration = self._direct_value_declaration(target)
+        return declaration is not None and declaration.is_pointer
+
+    def _filter_cpp_value_access(
+        self, access: dict[str, Any] | None, extent: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Do not claim builtin value access to a resolved C++ class element."""
+        if self.profile.name != "cpp" or access is None or extent is None:
+            return access
+        object_type = extent.get("object", {}).get("type", "")
+        if object_type and object_type not in _CPP_BUILTIN_ADDRESS_OF_TYPES:
+            # Class elements may overload assignment or conversion operators.
+            # Their declared extent remains valid, but V1 has no general C++
+            # value-access semantics to attach to that element.
+            return None
+        return access
+
+    def _memory_call_object_fact(self, node: Any) -> dict[str, str]:
+        """Resolve a memory API's destination argument, not its return target."""
+        argument = _first_call_argument(node)
+        identity = _unwrap_parentheses(argument)
+        while identity is not None and identity.type == "cast_expression":
+            identity = _unwrap_parentheses(identity.child_by_field_name("value"))
+        addressed = False
+        if identity is not None and identity.type == "pointer_expression" and (
+            _operator_of(identity, self.source) == "&"
+        ):
+            if not self._direct_builtin_address_of(identity):
+                return _object_fact({})
+            identity = _unwrap_parentheses(identity.child_by_field_name("argument"))
+            addressed = True
+        if identity is None or identity.type not in {"identifier", "field_expression"}:
+            return _object_fact({})
+        if not addressed and not self._memory_value_preserves_identity(identity):
+            # A value of class or builtin scalar type is not the address of its
+            # source variable. In C++ it may involve a user-defined conversion;
+            # even a C-style cast must not launder that identity back in.
+            return _object_fact({})
+        subject = self._root_identifier(identity)
+        if not subject:
+            return _object_fact({})
+        return _object_fact(self._subject_facts(identity, subject))
 
     def _subject_node(self, event_type: str, matched_name: str, node: Any) -> Any:
         """The expression the subject name was recovered from.
@@ -1457,6 +1585,23 @@ class SparseCfgBuilder:
             # name-based join, and the stage's reduction would be half of what
             # the declaration index actually buys.
             annotations.update(self._subject_facts(operand, subject))
+        extent = self._buffer_extent_facts(node, annotations)
+        if extent is not None:
+            annotations[BUFFER_EXTENT_KEY] = _facts_json(extent)
+        access = _access_facts(
+            node,
+            "DEREFERENCE",
+            self.source,
+            commuted=self._commuted_subscript(node),
+            pointer_commuted=self._commuted_pointer_addition(node),
+            cpp=self.profile.name == "cpp",
+        )
+        access = self._filter_cpp_value_access(access, extent)
+        if access is not None:
+            access["object"] = (
+                extent.get("object") if extent is not None else _object_fact(annotations)
+            )
+            annotations[MEMORY_ACCESS_KEY] = _facts_json(access)
         return self._new_point("DEREFERENCE", node, annotations=annotations, matched_name=text)
 
     def _deref_operand(self, node: Any) -> Any:
@@ -1464,6 +1609,488 @@ class SparseCfgBuilder:
         # expression is not what dereferences. C++ names the index field
         # `indices`, C names it `index`; only the subject matters here.
         return node.child_by_field_name("argument")
+
+    def _resolve_extent_declaration(self, node: Any, name: str) -> Any:
+        """Resolve through V1's statement-scope overlay, innermost outward."""
+        if self.declarations is None or not name:
+            return None
+        declaration = self.declarations.resolve(node.start_byte, name)
+        ancestor = node.parent
+        while ancestor is not None:
+            names = self._statement_declaration_names.get(ancestor.start_byte)
+            visible_from = names.get(name) if names is not None else None
+            if visible_from is not None and node.start_byte >= visible_from:
+                if declaration is None or not (
+                    ancestor.start_byte <= declaration.start_byte < ancestor.end_byte
+                ):
+                    # An unindexed statement/capture declaration still shadows
+                    # an outer array. A real declaration inside this overlay is
+                    # nested more deeply and must retain its own identity.
+                    return None
+                break
+            ancestor = ancestor.parent
+        while declaration is not None:
+            statement = self._statement_declaration_scopes.get(declaration.start_byte)
+            if statement is None or statement.start_byte <= node.start_byte < statement.end_byte:
+                return declaration
+            # The index owns only compound scopes and therefore returns a stale
+            # for/if/switch/while heading declaration after that statement. Ask
+            # again immediately before it so an outer visible declaration can
+            # still answer, instead of stopping at unknown after the first miss.
+            declaration = self.declarations.resolve(declaration.start_byte - 1, name)
+        return None
+
+    def _member_declaration_in_type(self, definition: Any, member: str) -> Any:
+        """Resolve a direct field inside one exact class/tag definition."""
+        if self.declarations is None or definition is None:
+            return None
+        body = definition.child_by_field_name("body")
+        if body is None:
+            return None
+        matches = []
+        for field_node in body.named_children:
+            if field_node.type != "field_declaration":
+                continue
+            for declarator in field_node.children_by_field_name("declarator"):
+                if _declarator_name(self.source, declarator) != member:
+                    continue
+                declaration = self.declarations.resolve(field_node.start_byte, member)
+                if (
+                    declaration is not None
+                    and declaration.storage == STORAGE_FIELD
+                    and declaration.start_byte == field_node.start_byte
+                    and declaration.name == member
+                ):
+                    matches.append(declaration)
+        return matches[0] if len(matches) == 1 else None
+
+    def _direct_this_member_declaration(self, node: Any, member: str) -> Any:
+        """Resolve `this->member` only in a lexically enclosing class body."""
+        ancestor = node.parent
+        while ancestor is not None:
+            if (
+                ancestor.type in {"class_specifier", "struct_specifier", "union_specifier"}
+                and ancestor.child_by_field_name("body") is not None
+            ):
+                return self._member_declaration_in_type(ancestor, member)
+            ancestor = ancestor.parent
+        # An out-of-line method has no enclosing class syntax. V1 does not use
+        # the legacy shallow owner/name fallback as positive type evidence.
+        return None
+
+    def _value_type_definition(self, declaration: Any) -> Any:
+        """The unique visible definition of an explicitly spelled class/tag.
+
+        Plain/qualified C++ type identifiers and aliases are outside V1. For an
+        elaborated `struct S` / `union S` spelling, one same-named definition in
+        the whole file must be visible from the declaration and precede it. This
+        deliberately rejects ambiguous namespace types and nested C tags rather
+        than borrowing whichever same-named field DeclarationIndex finds last.
+        """
+        type_node = self._value_declaration_types.get(
+            (declaration.start_byte, declaration.name)
+        )
+        if type_node is None or type_node.type not in {
+            "class_specifier", "struct_specifier", "union_specifier",
+        } or getattr(type_node, "has_error", False):
+            return None
+        name_node = type_node.child_by_field_name("name")
+        if name_node is None or name_node.type != "type_identifier":
+            return None
+        if _text_of(self.source, name_node) != declaration.type_token:
+            return None
+        if type_node.child_by_field_name("body") is not None:
+            # A definition in the object declaration itself is exact regardless
+            # of unrelated same-named types elsewhere in the file.
+            return type_node
+        if self.profile.name == "cpp" and declaration.type_token in self._value_type_aliases:
+            return None
+
+        definitions = []
+        for candidate in self._value_type_definitions:
+            candidate_name = candidate.child_by_field_name("name")
+            if candidate_name is None or candidate_name.type != "type_identifier":
+                continue
+            if _text_of(self.source, candidate_name) != declaration.type_token:
+                continue
+            same_kind = candidate.type == type_node.type or (
+                self.profile.name == "cpp"
+                and {candidate.type, type_node.type} <= {
+                    "class_specifier", "struct_specifier",
+                }
+            )
+            if same_kind:
+                definitions.append(candidate)
+        if len(definitions) != 1:
+            return None
+        definition = definitions[0]
+        if (
+            getattr(definition, "has_error", False)
+            or definition.start_byte >= declaration.start_byte
+        ):
+            return None
+
+        scope_types = {
+            "compound_statement", "function_definition", "namespace_definition",
+            "class_specifier", "struct_specifier", "union_specifier",
+            "translation_unit",
+        }
+        scope = definition.parent
+        while scope is not None and scope.type not in scope_types:
+            scope = scope.parent
+        if scope is None:
+            return None
+        ancestor = type_node.parent
+        while ancestor is not None:
+            if ancestor.type == scope.type and _span(ancestor) == _span(scope):
+                return definition
+            ancestor = ancestor.parent
+        return None
+
+    def _direct_member_declaration(
+        self, root_declaration: Any, member: str, operator: str
+    ) -> Any:
+        # `->` on a C++ class-like value may invoke overloaded operator->. A
+        # resolved raw pointer retains built-in member access in both languages.
+        if operator not in {".", "->"}:
+            return None
+        if operator == "->" and not root_declaration.is_pointer:
+            return None
+        definition = self._value_type_definition(root_declaration)
+        return self._member_declaration_in_type(definition, member)
+
+    def _direct_value_declaration(self, node: Any) -> Any:
+        """Declaration for a direct identifier or one-level member value.
+
+        This is V1's small amount of type evidence, not a general type resolver.
+        Member evidence comes from exact syntax and a unique visible type; the
+        shallow type_token / resolve_member lookup is never sufficient here.
+        """
+        node = _unwrap_parentheses(node)
+        if node is None:
+            return None
+        if node.type == "identifier":
+            name = _text_of(self.source, node)
+            return self._resolve_extent_declaration(node, name)
+        if node.type != "field_expression":
+            return None
+        root, member, this_root, _exact = self._member_chain(node)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", member or ""):
+            return None
+        argument = _unwrap_parentheses(node.child_by_field_name("argument"))
+        if this_root:
+            if argument is None or argument.type != "this":
+                return None
+            return self._direct_this_member_declaration(node, member)
+        if (
+            argument is None
+            or argument.type != "identifier"
+            or _text_of(self.source, argument) != root
+        ):
+            # Computed/dereferenced/nested roots do not preserve the shallow
+            # root Declaration's type, especially under C++ operator overloads.
+            return None
+        root_declaration = self._resolve_extent_declaration(node, root)
+        if root_declaration is None or not root_declaration.type_token:
+            return None
+        return self._direct_member_declaration(
+            root_declaration,
+            member,
+            _operator_of(node, self.source),
+        )
+
+    def _cpp_builtin_integral_expression(self, node: Any) -> bool:
+        """Whether C++ overload resolution cannot replace integral operators.
+
+        V1 does not infer class conversions. Numeric/character/boolean literals,
+        sizeof/alignof, declared builtin integral values, and operators whose
+        operands all satisfy the same rule are sufficient. Everything else is
+        deliberately unknown, even when a compiler could accept it.
+        """
+        node = _unwrap_parentheses(node)
+        if node is None:
+            return False
+        if node.type in {
+            "number_literal", "char_literal", "true", "false",
+            "sizeof_expression", "alignof_expression",
+        }:
+            return True
+        if node.type in {"identifier", "field_expression"}:
+            declaration = self._direct_value_declaration(node)
+            if declaration is None or declaration.is_pointer:
+                return False
+            key = (declaration.start_byte, declaration.name)
+            return (
+                key not in self._array_declaration_keys
+                and declaration.type_token in _CPP_BUILTIN_SUBSCRIPT_TYPES
+            )
+        if node.type == "unary_expression":
+            return self._cpp_builtin_integral_expression(
+                node.child_by_field_name("argument")
+            )
+        if node.type == "binary_expression":
+            return self._cpp_builtin_integral_expression(
+                node.child_by_field_name("left")
+            ) and self._cpp_builtin_integral_expression(
+                node.child_by_field_name("right")
+            )
+        if node.type == "conditional_expression":
+            # The condition affects only which already-integral arm is selected;
+            # it cannot turn the outer subscript into an overloaded operator.
+            return self._cpp_builtin_integral_expression(
+                node.child_by_field_name("consequence")
+            ) and self._cpp_builtin_integral_expression(
+                node.child_by_field_name("alternative")
+            )
+        return False
+
+    def _cpp_subscript_operand_kind(self, node: Any) -> str:
+        if self._cpp_builtin_integral_expression(node):
+            return "integral"
+        declaration = self._direct_value_declaration(node)
+        if declaration is None:
+            return "unknown"
+        key = (declaration.start_byte, declaration.name)
+        if key in self._array_declaration_keys:
+            return "array"
+        if declaration.is_pointer:
+            return "pointer"
+        return "other"
+
+    def _allocation_assignment_target_is_pointer(self, parent: Any) -> bool:
+        """Whether plain assignment/initialization stores into a pointer.
+
+        A C++ class LHS may overload `operator=` or converting-initialize from
+        `void *`; neither stores the allocation as that class object's buffer.
+        Restricting both languages to a resolved pointer also excludes numeric
+        handles produced by an integer cast.
+        """
+        field = "left" if parent.type == "assignment_expression" else "declarator"
+        target = _unwrap_parentheses(parent.child_by_field_name(field))
+        if parent.type == "init_declarator":
+            name = _declarator_name(self.source, target)
+            declaration = self._resolve_extent_declaration(parent, name)
+        else:
+            declaration = self._direct_value_declaration(target)
+        return declaration is not None and declaration.is_pointer
+
+    def _memory_value_preserves_identity(self, identity: Any) -> bool:
+        """Whether a destination value is a pointer/array for the named object."""
+        declaration = self._direct_value_declaration(identity)
+        if declaration is None:
+            return False
+        key = (declaration.start_byte, declaration.name)
+        return declaration.is_pointer or key in self._array_declaration_keys
+
+    def _commuted_subscript(self, expr: Any) -> bool | None:
+        """True for proven `index[array]`, False for ordinary subscripting.
+
+        None means V1 cannot prove the accessed target. C++ additionally needs
+        builtin operand/operator evidence: class-like operands may invoke
+        `operator[]` or overload the `+` hidden inside subscript semantics.
+        """
+        if expr.type != "subscript_expression":
+            return False
+        argument = _unwrap_parentheses(expr.child_by_field_name("argument"))
+        index = _unwrap_parentheses(_subscript_index_node(expr))
+        if argument is None or index is None:
+            return None if self.profile.name == "cpp" else False
+        if self.profile.name == "cpp":
+            argument_kind = self._cpp_subscript_operand_kind(argument)
+            index_kind = self._cpp_subscript_operand_kind(index)
+            if argument_kind in {"array", "pointer"} and index_kind == "integral":
+                return False
+            if argument_kind == "integral" and index_kind == "array":
+                # Keep V1's direct-array target boundary. A pointer on the right
+                # remains unknown rather than widening commuted normalization.
+                return True
+            return None
+        if argument.type == "number_literal":
+            return True
+        if argument.type != "identifier":
+            return False
+        argument_name = _text_of(self.source, argument)
+        argument_declaration = self._resolve_extent_declaration(argument, argument_name)
+        argument_is_array = (
+            (argument_declaration.start_byte, argument_declaration.name)
+            in self._array_declaration_keys
+            if argument_declaration is not None else False
+        )
+        if index.type == "identifier":
+            index_name = _text_of(self.source, index)
+            index_declaration = self._resolve_extent_declaration(index, index_name)
+            index_is_array = (
+                (index_declaration.start_byte, index_declaration.name)
+                in self._array_declaration_keys
+                if index_declaration is not None else False
+            )
+            if index_is_array and not argument_is_array:
+                return True
+            if (
+                argument_declaration is not None
+                and not argument_declaration.is_pointer
+                and not argument_is_array
+            ):
+                return None
+            return False
+        if (
+            index.type != "number_literal"
+            and argument_declaration is not None
+            and not argument_declaration.is_pointer
+            and not argument_is_array
+        ):
+            return None
+        return False
+
+    def _commuted_pointer_addition(self, expr: Any) -> bool | None:
+        """Orientation for unary `*(base + offset)`, or None when ambiguous."""
+        if expr.type != "pointer_expression" or _operator_of(expr, self.source) != "*":
+            return False
+        argument = _unwrap_parentheses(expr.child_by_field_name("argument"))
+        if argument is None or argument.type != "binary_expression":
+            return False
+        operator = _operator_of(argument, self.source)
+        if operator not in {"+", "-"}:
+            return False
+        left = _unwrap_parentheses(argument.child_by_field_name("left"))
+        right = _unwrap_parentheses(argument.child_by_field_name("right"))
+        if left is None or right is None:
+            return None
+
+        def declaration_and_array(node: Any) -> tuple[Any, bool]:
+            if node.type != "identifier":
+                return None, False
+            declaration = self._resolve_extent_declaration(
+                node, _text_of(self.source, node)
+            )
+            is_array = (
+                (declaration.start_byte, declaration.name)
+                in self._array_declaration_keys
+                if declaration is not None else False
+            )
+            return declaration, is_array
+
+        left_declaration, left_is_array = declaration_and_array(left)
+        right_declaration, right_is_array = declaration_and_array(right)
+        left_is_pointer = (
+            left_declaration.is_pointer if left_declaration is not None else False
+        )
+        right_is_pointer = (
+            right_declaration.is_pointer if right_declaration is not None else False
+        )
+
+        if self.profile.name == "cpp":
+            if left_is_array or left_is_pointer:
+                # Built-in pointer arithmetic also requires a builtin integral
+                # offset; a class/enum right operand could overload + or -.
+                return False if self._cpp_builtin_integral_expression(right) else None
+            if operator == "-":
+                return None
+            if self._cpp_builtin_integral_expression(left):
+                return True if right_is_array or right_is_pointer else None
+            return None
+
+        if operator == "-":
+            return False
+        if left.type == "number_literal":
+            return True
+        if left_is_array or left_is_pointer:
+            return False
+        if left_declaration is not None:
+            # A known scalar on the left can only be the offset. Normalize only
+            # a declared pointer/array right operand; otherwise fail closed.
+            return True if right_is_array or right_is_pointer else None
+        if right.type == "number_literal":
+            return False
+        return None
+
+    def _buffer_extent_facts(
+        self, expr: Any, annotations: Mapping[str, str] | None = None
+    ) -> dict[str, Any] | None:
+        """The declared or explicitly-unknown extent for a memory access.
+
+        A local array access often has only a DEREFERENCE carrier (the access
+        layer deliberately filters most local READ/WRITE points), so this fact
+        is attached here as well as to access points. Resolved arrays join by
+        the exact declaration returned by DeclarationIndex. Pointer/member
+        shapes that V1 cannot resolve get an explicit source="unknown" fact;
+        a plain non-array scalar access gets no buffer fact at all.
+        """
+        commuted = self._commuted_subscript(expr)
+        pointer_commuted = self._commuted_pointer_addition(expr)
+        inherited = _object_fact(annotations or {})
+
+        def unknown(limitation: str) -> dict[str, Any] | None:
+            if expr.type not in {"subscript_expression", "pointer_expression"}:
+                return None
+            return {
+                "source": "unknown", "unit": "elements", "expression": None,
+                "constant": None, "status": "unknown", "limitation": limitation,
+                "bytes": {
+                    "unit": "bytes", "expression": None, "constant": None,
+                    "status": "unknown", "limitation": limitation,
+                },
+                "object": inherited,
+            }
+
+        if commuted is None:
+            inherited = _object_fact({})
+            return unknown("commuted subscript target is not modeled in V1")
+        if pointer_commuted is None:
+            inherited = _object_fact({})
+            return unknown("commuted pointer arithmetic is not modeled in V1")
+        base = _array_extent_base(
+            expr, self.source, commuted=commuted, pointer_commuted=pointer_commuted
+        )
+        if base is None:
+            return unknown("pointer target extent is unavailable")
+        base = _unwrap_parentheses(base)
+        if base is not None and base.type == "subscript_expression":
+            return unknown("multidimensional subscripts are not modeled in V1")
+        if base is None or base.type not in {"identifier", "field_expression"}:
+            return unknown("cast or computed array bases are not modeled in V1")
+        root, member, this_root, _exact = self._member_chain(base)
+        if member:
+            inherited["member"] = member
+        # `s->buf[i]` requires a struct-type resolver that V1 does not have.
+        # A bare field and `this->buf` are safe because DeclarationIndex can
+        # resolve those fields directly; an arbitrary member path cannot borrow
+        # the root object's extent.
+        if member and not this_root:
+            return unknown("member array extent resolution is not modeled in V1")
+        name = member if this_root else root
+        if this_root:
+            declaration = self._direct_this_member_declaration(base, name)
+        else:
+            declaration = self._resolve_extent_declaration(base, name)
+        if declaration is None:
+            # Legacy subject facts intentionally retain the original shallow
+            # fallback. V1 never turns that fallback into positive extent/type
+            # evidence, especially for out-of-line methods with same-named types.
+            inherited = _object_fact({})
+            return unknown("pointer target declaration or extent is unavailable")
+        extent = self._array_extents.get((declaration.start_byte, declaration.name))
+        if extent is None:
+            inherited = self._object_for_declaration(declaration)
+            return unknown("pointer target is not a direct fixed-array declaration")
+        fact = dict(extent)
+        fact["object"] = self._object_for_declaration(declaration)
+        return fact
+
+    def _object_for_declaration(self, declaration: Any) -> dict[str, str]:
+        """V1 object identity plus the declaration's scope-qualified token.
+
+        The legacy `subject_decl` remains byte-identical (`local:a` for both an
+        outer and an inner `a`). V1 additionally carries the already-available
+        scoped identity so nested-block arrays do not collapse when a consumer
+        joins their facts. No existing subject annotation is changed.
+        """
+        value = _object_fact(self._facts_for(declaration, "", "true"))
+        if self.declarations is not None:
+            scoped = self.declarations.scoped_identity(declaration)
+            if scoped:
+                value["scoped_decl"] = scoped
+        return value
 
     # ------------------------------------------------------------------
     # the access layer (stage 5A)
@@ -1663,6 +2290,21 @@ class SparseCfgBuilder:
         annotations = {"expression": text}
         annotations["subject"] = subject
         annotations.update(facts)
+        extent = self._buffer_extent_facts(expr, annotations)
+        if extent is not None:
+            annotations[BUFFER_EXTENT_KEY] = _facts_json(extent)
+        access = _access_facts(
+            expr, event_type, self.source, origin=origin,
+            commuted=self._commuted_subscript(expr),
+            pointer_commuted=self._commuted_pointer_addition(expr),
+            cpp=self.profile.name == "cpp",
+        )
+        access = self._filter_cpp_value_access(access, extent)
+        if access is not None:
+            access["object"] = (
+                extent.get("object") if extent is not None else _object_fact(annotations)
+            )
+            annotations[MEMORY_ACCESS_KEY] = _facts_json(access)
         # R1: first-class access kind, additive to the READ/WRITE event. The
         # write half of a read-modify-write (`x += y`, `x++`, `--x`) is the one
         # access that is both; a plain `x = x + 1` writes (WRITE) and reads
@@ -2317,6 +2959,1048 @@ def _first_call_argument(node: Any) -> Any:
     if arguments is not None and arguments.named_children:
         return arguments.named_children[0]
     return None
+
+
+# ---------------------------------------------------------------------------
+# Buffer / Extent / Size facts V1 (issue-pilot#82)
+#
+# Two additive, versioned annotation keys ride on the points the walker already
+# publishes. Neither changes any existing key, the event identity, the edge
+# set or any defect query -- they only *describe* facts a later bounds query
+# (M5-M8) can consume:
+#
+#   buffer_extent_v1   on an ALLOC point (source="allocation") and on a
+#                      READ/WRITE/DEREFERENCE whose root resolves to a fixed
+#                      array declaration (source="declared_array")
+#   memory_access_v1   on a READ/WRITE/DEREFERENCE that carries a subscript
+#                      index or pointer offset, and on a memory-API CALL that
+#                      carries a length argument
+#
+# Both values are compact JSON (sorted keys) so the structure is versioned and
+# deterministic. Three states are kept distinct: a resolved constant
+# (status="constant" + "constant"), a retained-but-unevaluated expression
+# (status="expression"), and an explicitly-unknown or unsupported shape
+# (status="unknown"/"unsupported" + "limitation"). "Absent" means the point has
+# no such fact at all (a plain `int x` access publishes no buffer_extent_v1);
+# it never means "extent 0" or "in bounds". No bounds verdict is produced here.
+# ---------------------------------------------------------------------------
+
+BUFFER_EXTENT_KEY = "buffer_extent_v1"
+MEMORY_ACCESS_KEY = "memory_access_v1"
+
+# The size-argument position (0-based) for the allocators V1 models exactly.
+# `malloc(n)` -> 0, `realloc(p, n)` -> 1, `memalign(alignment, n)` -> 1,
+# `aligned_alloc(a, n)` -> 1, and the write-through
+# `posix_memalign(&p, a, n)` -> 2. Anything not listed (the
+# Windows/glibc convenience families, `new`, ...) stays explicitly unknown
+# rather than guessing which argument is a size.
+_ALLOC_SIZE_ARG = {
+    "malloc": 0, "realloc": 1, "memalign": 1, "valloc": 0, "pvalloc": 0,
+    "aligned_alloc": 1, "posix_memalign": 2,
+}
+# Calloc-like allocators take (count, element_size) as two arguments:
+# `calloc(n, sizeof(T))` -> (0, 1), `reallocarray(p, n, s)` -> (1, 2).
+_ALLOC_CALLOC_LIKE = {"calloc": (0, 1), "reallocarray": (1, 2)}
+
+# Memory-API byte-length argument position (0-based): `memcpy(d, s, n)` and
+# `memset(p, v, n)` -> 2. String-copy bounds are not byte extents in the
+# general case, so strncpy/strncat deliberately stay outside V1.
+_MEMORY_LENGTH_ARG = {"memcpy": 2, "memmove": 2, "memset": 2}
+
+_INT_SUFFIX = re.compile(r"[uUlL]+\Z")
+_CPP_BUILTIN_SUBSCRIPT_TYPES = frozenset({
+    "bool", "char", "signed", "unsigned", "short", "int", "long",
+    "wchar_t", "char8_t", "char16_t", "char32_t",
+})
+_CPP_BUILTIN_ADDRESS_OF_TYPES = _CPP_BUILTIN_SUBSCRIPT_TYPES | {
+    "float", "double", "nullptr_t",
+}
+_RAW_STRING_START = re.compile(r'(?:u8|u|U|L)?R"([^ ()\\\t\r\n]{0,16})\(')
+_TOKEN_JOIN_PAIRS = frozenset({
+    "++", "+=", "--", "-=", "->", ".*", "..", "::", ":>",
+    "<<", "<=", "<:", "<%", ">>", ">=", "==", "!=", "&&", "&=",
+    "||", "|=", "^^", "^=", "*=", "/=", "/*", "//", "%=", "%>",
+    "%:", "##",
+})
+
+
+def _needs_token_separator(previous: str, following: str) -> bool:
+    """Whether deleting whitespace would merge two C/C++ tokens."""
+    previous_word = previous.isalnum() or previous == "_"
+    following_word = following.isalnum() or following == "_"
+    if previous_word and following_word:
+        return True
+    if previous_word and following in {'"', "'"}:
+        return True
+    if previous in {'"', "'"} and following_word:
+        return True
+    if (previous.isdigit() and following == ".") or (previous == "." and following.isdigit()):
+        return True
+    return previous + following in _TOKEN_JOIN_PAIRS
+
+
+def _facts_json(obj: dict[str, Any]) -> str:
+    """Deterministic, compact JSON for a versioned fact block."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def _object_fact(annotations: Mapping[str, str]) -> dict[str, str]:
+    """The existing subject identity, embedded without inventing a second one.
+
+    Local declaration tokens are owner-scoped: consumers must use this object
+    together with the carrier event's owner/event id, never join on `decl` alone.
+    """
+    return {
+        "decl": annotations.get("subject_decl", ""),
+        "storage": annotations.get("subject_storage", STORAGE_UNKNOWN),
+        "type": annotations.get("subject_type", ""),
+        "member": annotations.get("subject_member", ""),
+    }
+
+
+def _allocation_result_is_directly_bound(
+    node: Any,
+    allow_comma: bool,
+    assignment_target_is_pointer: Callable[[Any], bool],
+    cpp: bool = False,
+) -> bool:
+    """Whether an allocator's result, not a sibling expression, is assigned."""
+    current = node
+    while current is not None:
+        parent = current.parent
+        if parent is None:
+            return False
+        if parent.type == "parenthesized_expression":
+            current = parent
+            continue
+        if parent.type == "cast_expression":
+            if cpp:
+                # A class-type cast can construct a temporary whose conversion
+                # operator returns an unrelated pointer. Only a syntactic pointer
+                # result preserves this already-pointer allocation value without
+                # invoking a C++ user-defined conversion.
+                descriptor = parent.child_by_field_name("type")
+                declarator = (
+                    descriptor.child_by_field_name("declarator")
+                    if descriptor is not None else None
+                )
+                if declarator is None or declarator.type != "abstract_pointer_declarator":
+                    return False
+            current = parent
+            continue
+        if parent.type in {"assignment_expression", "init_declarator"}:
+            if _is_read_modify_write(parent) or not assignment_target_is_pointer(parent):
+                return False
+            if parent.type == "assignment_expression":
+                target = _unwrap_parentheses(parent.child_by_field_name("left"))
+                while target is not None and target.type == "field_expression":
+                    target = _unwrap_parentheses(target.child_by_field_name("argument"))
+                if target is None or target.type not in {"identifier", "this"}:
+                    # `*pp = malloc(n)` binds pp's pointee, not pp itself.
+                    # V1 has no points-to identity for that target; subscript,
+                    # dereference and computed LHS shapes therefore fail closed.
+                    return False
+            value_field = "right" if parent.type == "assignment_expression" else "value"
+            value = parent.child_by_field_name(value_field)
+            return value is not None and _span(value) == _span(current)
+        if parent.type == "comma_expression":
+            if not allow_comma:
+                # C++ may overload operator, even when the allocator is the
+                # right operand, so the outer value need not be its result.
+                return False
+            right = parent.child_by_field_name("right")
+            if right is None or _span(right) != _span(current):
+                return False
+            current = parent
+            continue
+        if parent.type == "conditional_expression":
+            if cpp:
+                # Conditional class conversion can transform the selected arm
+                # after that arm was chosen. V1 does not attempt partial C++
+                # conditional-type resolution; even a pointer-only conditional
+                # therefore stays an unbound allocation object.
+                return False
+            consequence = parent.child_by_field_name("consequence")
+            alternative = parent.child_by_field_name("alternative")
+            if _span(current) not in {_span(consequence), _span(alternative)}:
+                return False
+            current = parent
+            continue
+        return False
+    return False
+
+
+def _allocation_object_fact(
+    annotations: Mapping[str, str],
+    node: Any,
+    out_argument_is_direct: bool,
+    allow_comma: bool,
+    assignment_target_is_pointer: Callable[[Any], bool],
+    cpp: bool = False,
+) -> dict[str, str]:
+    """The object bound to an allocation result, or explicitly unknown.
+
+    The legacy CALL/ALLOC fallback names the first call argument. That is useful
+    to existing queries but is not an allocation-object claim: in `malloc(n)`,
+    `n` is a size, not the returned buffer. Only a direct value-flow path to an
+    assignment and write-through out-argument recovery bind the result in V1.
+    """
+    subject_from = annotations.get("subject_from")
+    if subject_from == SUBJECT_FROM_OUT_ARGUMENT:
+        if out_argument_is_direct:
+            return _object_fact(annotations)
+        return _object_fact({})
+    if subject_from == SUBJECT_FROM_ASSIGNMENT and _allocation_result_is_directly_bound(
+        node,
+        allow_comma=allow_comma,
+        assignment_target_is_pointer=assignment_target_is_pointer,
+        cpp=cpp,
+    ):
+        return _object_fact(annotations)
+    return _object_fact({})
+
+
+def _fact_expression_text(source: bytes, node: Any) -> str:
+    """Compact source syntax without deleting semantic whitespace.
+
+    Unlike the legacy `_expression_text`, fact expressions must preserve spaces
+    inside ordinary/raw string and character literals (`"a b"`) and between
+    adjacent word tokens (`signed char`, `unsigned long`). Comments act as
+    token-separating whitespace. Other formatting whitespace is removed to
+    retain the deterministic compact spelling (`n - 1` -> `n-1`).
+    """
+    text = _text_of(source, node)
+    result: list[str] = []
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if quote:
+            result.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = ""
+            index += 1
+            continue
+        previous_is_word = index > 0 and (text[index - 1].isalnum() or text[index - 1] == "_")
+        raw = None if previous_is_word else _RAW_STRING_START.match(text, index)
+        if raw is not None:
+            closing = f"){raw.group(1)}\""
+            end = text.find(closing, raw.end())
+            if end < 0:
+                # An incomplete raw literal is erroneous source, but deleting
+                # its contents would still corrupt the retained expression.
+                result.append(text[index:])
+                break
+            end += len(closing)
+            result.append(text[index:end])
+            index = end
+            continue
+        if character in {'"', "'"}:
+            quote = character
+            result.append(character)
+            index += 1
+            continue
+        is_comment = text.startswith("/*", index) or text.startswith("//", index)
+        if character.isspace() or is_comment:
+            following = index
+            while following < len(text):
+                if text[following].isspace():
+                    following += 1
+                    continue
+                if text.startswith("/*", following):
+                    close = text.find("*/", following + 2)
+                    following = len(text) if close < 0 else close + 2
+                    continue
+                if text.startswith("//", following):
+                    close_candidates = [
+                        position for position in (text.find("\n", following + 2), text.find("\r", following + 2))
+                        if position >= 0
+                    ]
+                    following = min(close_candidates) if close_candidates else len(text)
+                    continue
+                break
+            if result and following < len(text) and _needs_token_separator(
+                result[-1], text[following]
+            ):
+                result.append(" ")
+            index = following
+            continue
+        result.append(character)
+        index += 1
+    return "".join(result).strip()
+
+
+def _product_operand(node: Any, text: str) -> str:
+    """Parenthesize an operand whose precedence is below multiplication."""
+    if node is not None and node.type in {
+        "binary_expression", "conditional_expression", "assignment_expression",
+        "comma_expression",
+    }:
+        return f"({text})"
+    return text
+
+
+def _byte_product_expression(size_node: Any, expression: str, type_text: str) -> str:
+    return f"{_product_operand(size_node, expression)} * sizeof({type_text or 'unknown'})"
+
+
+_STATEMENT_LOCAL_SCOPES = frozenset({
+    "for_statement", "for_range_loop", "range_based_for_statement",
+    "if_statement", "switch_statement", "while_statement",
+})
+
+
+def _declarator_inner(node: Any) -> Any:
+    inner = node.child_by_field_name("declarator")
+    if inner is None and node.type in {
+        "reference_declarator", "parenthesized_declarator",
+    } and node.named_children:
+        inner = node.named_children[-1]
+    return inner
+
+
+def _declarator_name(source: bytes, node: Any) -> str:
+    """Read a declared name through the grammar's transparent wrappers."""
+    while node is not None:
+        if node.type in {"identifier", "field_identifier", "type_identifier"}:
+            return _text_of(source, node)
+        if node.type in {
+            "init_declarator", "function_declarator", "pointer_declarator",
+            "reference_declarator", "array_declarator", "parenthesized_declarator",
+        }:
+            inner = _declarator_inner(node)
+            node = inner
+            continue
+        return ""
+    return ""
+
+
+def _statement_local_scope(declaration: Any) -> Any:
+    """The statement-owned scope of a heading declaration, if it has one."""
+    parent = declaration.parent
+    while parent is not None:
+        if parent.type in _STATEMENT_LOCAL_SCOPES:
+            return parent
+        if parent.type in {
+            "compound_statement", "function_definition", "class_specifier",
+            "struct_specifier", "union_specifier", "translation_unit",
+        }:
+            break
+        parent = parent.parent
+    return None
+
+
+def _collect_statement_declaration_scopes(
+    root: Any, source: bytes
+) -> tuple[dict[int, Any], dict[int, dict[str, int]]]:
+    """Index statement-heading names without changing DeclarationIndex.
+
+    Ordinary heading declarations already have Declaration objects, but the
+    installed C++ grammar represents a range-for declaration directly on the
+    `for_range_loop` node. Recording both shapes lets the extent layer reject
+    an outer same-named array inside that statement and skip stale heading
+    declarations after it, without minting an identity for an unindexed range
+    declarator. Each name carries its first visible byte: range initializers
+    and structured-binding initializers still belong to the enclosing scope.
+    """
+    scope_by_declaration: dict[int, Any] = {}
+    names_by_statement: dict[int, dict[str, int]] = {}
+
+    def record_name(statement: Any, declarator: Any, visible_from: int) -> None:
+        if declarator is None:
+            return
+        if declarator.type == "init_declarator":
+            record_name(
+                statement, declarator.child_by_field_name("declarator"), visible_from
+            )
+            return
+        if declarator.type == "structured_binding_declarator":
+            for child in declarator.named_children:
+                if child.type == "identifier":
+                    record_name(statement, child, visible_from)
+            return
+        name = _declarator_name(source, declarator)
+        if name:
+            names = names_by_statement.setdefault(statement.start_byte, {})
+            names[name] = min(visible_from, names.get(name, visible_from))
+
+    def visit(node: Any) -> None:
+        if node.type == "declaration":
+            statement = _statement_local_scope(node)
+            if statement is not None:
+                scope_by_declaration[node.start_byte] = statement
+                for declarator in node.children_by_field_name("declarator"):
+                    record_name(statement, declarator, node.end_byte)
+        elif node.type in {"for_range_loop", "range_based_for_statement"}:
+            body = node.child_by_field_name("body")
+            record_name(
+                node, node.child_by_field_name("declarator"),
+                body.start_byte if body is not None else node.end_byte,
+            )
+        elif node.type == "lambda_expression":
+            # An init-capture declares a new object only inside the lambda body.
+            # It must not hide an outer same-named array, but the initializer
+            # itself remains in the enclosing scope and is therefore excluded.
+            capture = next(
+                (child for child in node.named_children
+                 if child.type == "lambda_capture_specifier"),
+                None,
+            )
+            body = next(
+                (child for child in node.named_children
+                 if child.type == "compound_statement"),
+                None,
+            )
+            if capture is not None and body is not None:
+                for initializer in capture.named_children:
+                    if initializer.type != "lambda_capture_initializer":
+                        continue
+                    name = next(
+                        (child for child in initializer.named_children
+                         if child.type == "identifier"),
+                        None,
+                    )
+                    record_name(body, name, body.start_byte)
+        for child in node.named_children:
+            visit(child)
+
+    visit(root)
+    return scope_by_declaration, names_by_statement
+
+
+def _unwrap_parentheses(node: Any) -> Any:
+    while node is not None and node.type == "parenthesized_expression":
+        node = node.named_children[0] if node.named_children else None
+    return node
+
+
+def _parent_through_parentheses(node: Any) -> tuple[Any, Any]:
+    current = node
+    parent = current.parent
+    while parent is not None and parent.type == "parenthesized_expression":
+        current = parent
+        parent = current.parent
+    return current, parent
+
+
+def _cpp_reference_cast_transparency(
+    current: Any, parent: Any, source: bytes
+) -> bool | None:
+    """Whether a cast preserves a builtin lvalue for outer WRITE propagation.
+
+    ``True`` accepts only a C-style cast to a primitive lvalue reference or the
+    equivalent ``static_cast``. ``False`` rejects a recognized reference cast
+    whose semantics V1 cannot prove. ``None`` means this is not a reference
+    cast, so ordinary READ handling can continue.
+    """
+    type_node = None
+    cast_name = ""
+    if parent.type == "cast_expression":
+        value = parent.child_by_field_name("value")
+        if value is None or _span(value) != _span(current):
+            return None
+        type_node = parent.child_by_field_name("type")
+    elif parent.type == "call_expression":
+        function = parent.child_by_field_name("function")
+        arguments = parent.child_by_field_name("arguments")
+        if function is None or function.type != "template_function" or arguments is None:
+            return None
+        if len(arguments.named_children) != 1 or (
+            _span(arguments.named_children[0]) != _span(current)
+        ):
+            return None
+        identifier = next(
+            (child for child in function.named_children if child.type == "identifier"),
+            None,
+        )
+        template = next(
+            (child for child in function.named_children
+             if child.type == "template_argument_list"),
+            None,
+        )
+        if identifier is None or template is None or len(template.named_children) != 1:
+            return None
+        cast_name = _text_of(source, identifier)
+        if cast_name not in {"static_cast", "const_cast", "reinterpret_cast", "dynamic_cast"}:
+            return None
+        type_node = template.named_children[0]
+    else:
+        return None
+
+    if type_node is None or type_node.type != "type_descriptor":
+        return None
+    references = [
+        child for child in type_node.named_children
+        if child.type == "abstract_reference_declarator"
+    ]
+    if not references:
+        return None
+    if len(references) != 1 or _text_of(source, references[0]) != "&":
+        return False
+    is_builtin = any(child.type == "primitive_type" for child in type_node.named_children)
+    if is_builtin and (parent.type == "cast_expression" or cast_name == "static_cast"):
+        return True
+    return False
+
+
+def _semantic_access_kind(
+    expr: Any,
+    carrier_event_type: str,
+    source: bytes,
+    origin: Any = None,
+    cpp: bool = False,
+) -> str | None:
+    """READ/WRITE/RMW for a value access, or None for a non-value use."""
+    ancestor = expr.parent
+    while ancestor is not None:
+        if ancestor.type in {
+            "sizeof_expression", "alignof_expression", "decltype",
+            "decltype_specifier", "noexcept_expression",
+        }:
+            return None
+        if ancestor.type == "call_expression":
+            function = ancestor.child_by_field_name("function")
+            if function is not None and _expression_text(source, function) == "noexcept":
+                return None
+        ancestor = ancestor.parent
+
+    current, parent = _parent_through_parentheses(expr)
+    while parent is not None:
+        if parent.type == "parenthesized_expression":
+            current, parent = _parent_through_parentheses(parent)
+            continue
+        if parent.type in {"field_expression", "subscript_expression"}:
+            argument = parent.child_by_field_name("argument")
+            if argument is None or _span(argument) != _span(current):
+                break
+            if parent.type == "field_expression" and _operator_of(parent, source) == "->":
+                # `a[i]->x = 0` writes `x`, but it must read the pointer stored
+                # in `a[i]`. Dot-member lvalue paths remain transparent below.
+                return "READ"
+            current, parent = _parent_through_parentheses(parent)
+            continue
+        if parent.type == "conditional_expression":
+            consequence = parent.child_by_field_name("consequence")
+            alternative = parent.child_by_field_name("alternative")
+            if _span(current) not in {_span(consequence), _span(alternative)}:
+                break
+            current, parent = _parent_through_parentheses(parent)
+            continue
+        if parent.type == "comma_expression":
+            if cpp:
+                # An overloaded comma need not return its right operand, so an
+                # outer assignment says nothing about a write to that operand.
+                return None
+            # Only the right operand supplies a C comma-expression's result.
+            right = parent.child_by_field_name("right")
+            if right is None or _span(right) != _span(current):
+                break
+            current, parent = _parent_through_parentheses(parent)
+            continue
+        if parent.type == "pointer_expression" and _operator_of(parent, source) == "&":
+            if cpp:
+                # `operator&` may return an unrelated pointer. Without a full
+                # expression-type resolver V1 never cancels a C++ `*&` pair.
+                return None
+            addressed, outer = _parent_through_parentheses(parent)
+            if outer is None or outer.type != "pointer_expression" or (
+                _operator_of(outer, source) != "*"
+            ):
+                return None
+            argument = outer.child_by_field_name("argument")
+            if argument is None or _span(argument) != _span(addressed):
+                return None
+            current, parent = _parent_through_parentheses(outer)
+            continue
+        if cpp and parent.type == "argument_list" and (
+            parent.parent is not None and parent.parent.type == "call_expression"
+        ):
+            # Named C++ casts wrap their sole value in an argument_list. Let the
+            # reference-cast check below inspect the cast itself; ordinary calls
+            # remain non-transparent and fall through to READ.
+            parent = parent.parent
+        if cpp:
+            reference_cast = _cpp_reference_cast_transparency(current, parent, source)
+            if reference_cast is True:
+                current, parent = _parent_through_parentheses(parent)
+                continue
+            if reference_cast is False:
+                # A user-defined or otherwise unproven reference cast need not
+                # preserve the source element. Do not default its access to READ.
+                return None
+        break
+
+    if carrier_event_type != "DEREFERENCE":
+        if carrier_event_type == "WRITE" and origin is not None and _is_read_modify_write(origin):
+            return "READ_MODIFY_WRITE"
+        return carrier_event_type
+    if parent is not None and parent.type == "assignment_expression":
+        left = parent.child_by_field_name("left")
+        if left is not None and _span(left) == _span(current):
+            return "READ_MODIFY_WRITE" if _is_read_modify_write(parent) else "WRITE"
+    if parent is not None and parent.type == "update_expression":
+        argument = parent.child_by_field_name("argument")
+        if argument is not None and _span(argument) == _span(current):
+            return "READ_MODIFY_WRITE"
+    return "READ"
+
+
+def _array_extent_base(
+    expr: Any,
+    source: bytes,
+    commuted: bool = False,
+    pointer_commuted: bool = False,
+) -> Any:
+    """The expression naming the declared array, or None for an unsafe join."""
+    if expr.type == "subscript_expression":
+        if commuted:
+            return _subscript_index_node(expr)
+        return expr.child_by_field_name("argument")
+    if expr.type in {"identifier", "field_expression"}:
+        return expr
+    if expr.type == "pointer_expression" and _operator_of(expr, source) == "*":
+        argument = _unwrap_parentheses(expr.child_by_field_name("argument"))
+        if argument is not None and argument.type == "binary_expression" and (
+            _operator_of(argument, source) in {"+", "-"}
+        ):
+            if _operator_of(argument, source) == "+" and pointer_commuted:
+                return argument.child_by_field_name("right")
+            return argument.child_by_field_name("left")
+    return None
+
+
+def _const_int(node: Any, source: bytes) -> int | None:
+    """Fold only target-independent, non-negative signed-int expressions.
+
+    Numeric literals and `*`/`<<`/`+` are retained only when every operand and
+    result fits a signed 32-bit int. Unsigned-suffixed literals, negative
+    values, wider results and invalid shift counts return None: without target
+    integer semantics, Python's unbounded arithmetic could otherwise invent a
+    value that C/C++ does not have. The bounds also make malformed/UB source
+    fail closed instead of raising or allocating an enormous integer.
+    """
+    while node is not None and node.type == "parenthesized_expression":
+        node = node.named_children[0] if node.named_children else None
+    if node is None:
+        return None
+    maximum = 2_147_483_647
+    if node.type == "number_literal":
+        raw = _fact_expression_text(source, node)
+        text = _INT_SUFFIX.sub("", raw)
+        suffix = raw[len(text):]
+        if "u" in suffix.lower() or len(text) > 40:
+            return None
+        try:
+            # Python's base-0 parser rejects C's traditional octal spelling.
+            if re.fullmatch(r"0[0-7]+", text):
+                value = int(text, 8)
+            else:
+                value = int(text, 0)
+        except ValueError:
+            return None
+        return value if 0 <= value <= maximum else None
+    if node.type == "binary_expression":
+        operator = _operator_of(node, source)
+        if operator not in {"*", "<<", "+"}:
+            return None
+        left = _const_int(node.child_by_field_name("left"), source)
+        right = _const_int(node.child_by_field_name("right"), source)
+        if left is None or right is None:
+            return None
+        if operator == "*":
+            if right and left > maximum // right:
+                return None
+            return left * right
+        if operator == "<<":
+            if right > 30 or left > (maximum >> right):
+                return None
+            return left << right
+        if left > maximum - right:
+            return None
+        return left + right
+    return None
+
+
+def _callee_leaf(matched_name: str) -> str:
+    """The last name component of a callee (`ns::malloc`/`M.malloc` -> `malloc`)."""
+    return matched_name.rpartition(".")[2].rpartition("::")[2]
+
+
+def _call_argument_nodes(node: Any) -> list[Any]:
+    arguments = node.child_by_field_name("arguments")
+    return list(arguments.named_children) if arguments is not None else []
+
+
+def _alloc_extent_facts(node: Any, matched_name: str, source: bytes) -> dict[str, Any]:
+    """buffer_extent_v1 for an ALLOC point (source="allocation").
+
+    Constant sizes fold to `constant`; dynamic sizes keep their expression with
+    status="expression" and an explicit null value. Allocators V1 does not
+    model, and C++ `new` (no argument list), report status="unknown" with a
+    limitation -- never a fabricated extent. Unit is bytes for this family.
+    """
+    callee = _callee_leaf(matched_name)
+    args = _call_argument_nodes(node)
+    fact: dict[str, Any] = {
+        "source": "allocation", "unit": "bytes", "expression": None,
+        "constant": None, "status": "unknown", "limitation": "",
+    }
+    if callee in _ALLOC_CALLOC_LIKE:
+        count_i, size_i = _ALLOC_CALLOC_LIKE[callee]
+        if len(args) <= max(count_i, size_i):
+            fact["limitation"] = "calloc-like arity"
+            return fact
+        count_node, size_node = args[count_i], args[size_i]
+        count_text = _fact_expression_text(source, count_node)
+        size_text = _fact_expression_text(source, size_node)
+        count = _const_int(count_node, source)
+        elem = _const_int(size_node, source)
+        fact.update(
+            expression=(
+                f"{_product_operand(count_node, count_text)} * "
+                f"{_product_operand(size_node, size_text)}"
+            ),
+            count_expression=count_text,
+            element_size_expression=size_text,
+        )
+        if count is not None and elem is not None:
+            product = count * elem
+            if product <= 2_147_483_647:
+                fact.update(status="constant", constant=product)
+            else:
+                fact.update(
+                    status="expression",
+                    limitation="allocation size exceeds signed 32-bit range",
+                )
+        else:
+            fact.update(
+                status="expression",
+                limitation="count or element size is not a compile-time constant",
+            )
+        return fact
+    if callee not in _ALLOC_SIZE_ARG:
+        fact["limitation"] = "allocator size argument not modeled in V1"
+        return fact
+    index = _ALLOC_SIZE_ARG[callee]
+    if len(args) <= index:
+        fact["limitation"] = "missing size argument"
+        return fact
+    size_node = args[index]
+    fact["expression"] = _fact_expression_text(source, size_node)
+    value = _const_int(size_node, source)
+    if value is not None:
+        fact.update(status="constant", constant=value)
+    else:
+        fact.update(status="expression", limitation="size is not a compile-time constant")
+    return fact
+
+
+def _memory_call_facts(node: Any, matched_name: str, source: bytes) -> dict[str, Any] | None:
+    """memory_access_v1 for a memcpy/memmove/memset byte length, or None."""
+    function = node.child_by_field_name("function")
+    if function is None or function.type not in {"identifier", "qualified_identifier"}:
+        return None
+    callee_text = _fact_expression_text(source, function)
+    callee = _callee_leaf(callee_text or matched_name)
+    if function.type == "qualified_identifier" and callee_text != f"std::{callee}":
+        # Same-named functions in user namespaces do not inherit the standard
+        # memory API's semantics. Only the exact std::<leaf> spelling is V1.
+        return None
+    if callee not in _MEMORY_LENGTH_ARG:
+        return None
+    args = _call_argument_nodes(node)
+    index = _MEMORY_LENGTH_ARG[callee]
+    if len(args) <= index:
+        return {
+            "access": "CALL", "kind": "memory_length", "unit": "bytes",
+            "function": callee_text, "expression": None, "constant": None,
+            "status": "unknown", "limitation": "missing length argument",
+        }
+    length_node = args[index]
+    value = _const_int(length_node, source)
+    fact: dict[str, Any] = {
+        "access": "CALL", "kind": "memory_length", "unit": "bytes",
+        "function": callee_text,
+        "expression": _fact_expression_text(source, length_node), "constant": value,
+    }
+    if value is not None:
+        fact.update(status="constant", limitation="")
+    else:
+        fact.update(status="expression", limitation="length is not a compile-time constant")
+    return fact
+
+
+def _subscript_index_node(expr: Any) -> Any:
+    """The index expression of a subscript, across the two grammar spellings.
+
+    tree-sitter-cpp names the field `indices` (a node that wraps the brackets),
+    tree-sitter-c names it `index` (the bare expression). Unwrap a wrapper down
+    to the real expression so `buf[5]` folds in both dialects.
+    """
+    index_node = expr.child_by_field_name("indices")
+    if index_node is not None:
+        if index_node.type != "subscript_argument_list":
+            return None
+        children = index_node.named_children
+        return children[0] if len(children) == 1 else None
+    index_node = expr.child_by_field_name("index")
+    if index_node is None or index_node.type == "ERROR" or getattr(index_node, "is_missing", False):
+        return None
+    return index_node
+
+
+def _access_facts(
+    expr: Any, event_type: str, source: bytes, origin: Any = None,
+    commuted: bool | None = False,
+    pointer_commuted: bool | None = False,
+    cpp: bool = False,
+) -> dict[str, Any] | None:
+    """memory_access_v1 for a subscript or supported pointer-offset shape.
+
+    `access` is the semantic operation, not necessarily the carrier event type:
+    a local array write carried by DEREFERENCE still records WRITE. Address-of
+    and unevaluated sizeof operands publish no access fact. A plain `*p` or
+    bare identifier has no structured index/offset and publishes no fact.
+    """
+    access = _semantic_access_kind(
+        expr, event_type, source, origin=origin, cpp=cpp
+    )
+    if access is None:
+        return None
+    if expr.type == "subscript_expression":
+        if commuted is None:
+            return {
+                "access": access, "kind": "subscript", "unit": "elements",
+                "expression": None, "constant": None, "status": "unknown",
+                "limitation": "commuted subscript target is not modeled in V1",
+            }
+        index_node = (
+            expr.child_by_field_name("argument") if commuted else _subscript_index_node(expr)
+        )
+        if index_node is None:
+            return {
+                "access": access, "kind": "subscript", "unit": "elements",
+                "expression": None, "constant": None, "status": "unknown",
+                "limitation": "unparsed or multiple subscript indices",
+            }
+        value = _const_int(index_node, source)
+        fact: dict[str, Any] = {
+            "access": access, "kind": "subscript", "unit": "elements",
+            "expression": _fact_expression_text(source, index_node), "constant": value,
+        }
+        if value is not None:
+            fact.update(status="constant", limitation="")
+        else:
+            fact.update(status="expression", limitation="index is not a compile-time constant")
+        return fact
+    if expr.type == "pointer_expression" and _operator_of(expr, source) == "*":
+        if pointer_commuted is None:
+            return {
+                "access": access, "kind": "pointer_offset", "unit": "elements",
+                "expression": None, "constant": None, "status": "unknown",
+                "limitation": "commuted pointer arithmetic is not modeled in V1",
+            }
+        argument = _unwrap_parentheses(expr.child_by_field_name("argument"))
+        if argument is not None and argument.type == "binary_expression" and (
+            _operator_of(argument, source) in {"+", "-"}
+        ):
+            operator = _operator_of(argument, source)
+            is_commuted = operator == "+" and pointer_commuted
+            base_node = (
+                argument.child_by_field_name("right" if is_commuted else "left")
+            )
+            base = _unwrap_parentheses(base_node)
+            offset_node = argument.child_by_field_name("left" if is_commuted else "right")
+            if base is None or base.type not in {"identifier", "field_expression"}:
+                return {
+                    "access": access, "kind": "pointer_offset", "unit": "elements",
+                    "expression": _fact_expression_text(source, argument), "constant": None,
+                    "status": "unknown", "limitation": "complex pointer arithmetic",
+                }
+            if offset_node is not None:
+                value = _const_int(offset_node, source)
+                offset_text = _fact_expression_text(source, offset_node)
+                fact = {
+                    "access": access, "kind": "pointer_offset", "unit": "elements",
+                    "expression": offset_text if operator == "+" else f"-({offset_text})",
+                    "constant": value if operator == "+" or value is None else -value,
+                }
+                if value is not None:
+                    fact.update(status="constant", limitation="")
+                else:
+                    fact.update(status="expression", limitation="offset is not a compile-time constant")
+                return fact
+    return None
+
+
+def _collect_array_extents(
+    root: Any, source: bytes,
+) -> tuple[
+    dict[tuple[int, str], dict[str, Any]],
+    set[tuple[int, str]],
+    dict[tuple[int, str], Any],
+    list[Any],
+    set[str],
+]:
+    """Map declaration identity to extent and bounded member-type syntax.
+
+    The second result includes array-adjusted parameters. It carries no extent
+    claim; it only gives commuted-subscript handling enough syntax evidence to
+    distinguish `parameter_array[i]` from `i[parameter_array]`.
+
+    The last three results retain exact syntax nodes for V1's direct member
+    type check. A shallow `Declaration.type_token` cannot distinguish
+    `M::Same` from `N::Same`, or two nested C tags named `S`; consumers must
+    prove one visible definition instead of calling `resolve_member` directly.
+
+    The key mirrors `Declaration.start_byte` and `Declaration.name`, so shadowed
+    arrays and `int a[4], b[8]` cannot be joined by a use-site spelling alone.
+    Only direct, single-dimensional arrays are modeled. Parameters (adjusted to
+    pointers), pointers/references to arrays, multidimensional arrays, VLA and
+    flexible members stay explicitly unknown/unsupported. Byte extent is given
+    only for char arrays; other element sizes are target-ABI facts V1 cannot
+    invent. Statement-local visibility is handled by the builder's separate
+    overlay, so this map contains only serializable facts.
+    """
+    extents: dict[tuple[int, str], dict[str, Any]] = {}
+    array_declaration_keys: set[tuple[int, str]] = set()
+    value_declaration_types: dict[tuple[int, str], Any] = {}
+    value_type_definitions: list[Any] = []
+    value_type_aliases: set[str] = set()
+    character_types = {"char", "signed char", "unsigned char"}
+
+    def unknown_bytes(expression: str | None, limitation: str) -> dict[str, Any]:
+        return {
+            "unit": "bytes", "expression": expression, "constant": None,
+            "status": "unknown", "limitation": limitation,
+        }
+
+    def visit(node: Any) -> None:
+        if node.type in {"class_specifier", "struct_specifier", "union_specifier"}:
+            if node.child_by_field_name("body") is not None:
+                value_type_definitions.append(node)
+        if node.type in {"alias_declaration", "type_definition", "using_declaration"}:
+            names = []
+            if node.type == "alias_declaration":
+                names = [node.child_by_field_name("name")]
+            else:
+                names = list(node.children_by_field_name("declarator"))
+                if node.type == "using_declaration" and not names:
+                    # `using M::Same` introduces Same; `using namespace M`
+                    # conservatively marks M even though it is not a type alias.
+                    spelling = _fact_expression_text(source, node)
+                    identifiers = re.findall(r"[A-Za-z_][A-Za-z_0-9]*", spelling)
+                    if identifiers:
+                        value_type_aliases.add(identifiers[-1])
+            for name_node in names:
+                name = _declarator_name(source, name_node)
+                if name:
+                    value_type_aliases.add(name)
+        if node.type in {"declaration", "field_declaration", "parameter_declaration"}:
+            type_node = node.child_by_field_name("type")
+            declarators = list(node.children_by_field_name("declarator"))
+            if type_node is not None:
+                for declarator in declarators:
+                    name = _declarator_name(source, declarator)
+                    if name:
+                        value_declaration_types[(node.start_byte, name)] = type_node
+            type_text = (
+                _fact_expression_text(source, type_node) if type_node is not None else ""
+            )
+            for declarator in declarators:
+                array = declarator
+                if array is not None and array.type == "init_declarator":
+                    array = array.child_by_field_name("declarator")
+                while array is not None and array.type == "parenthesized_declarator":
+                    array = _declarator_inner(array)
+                if array is None or array.type != "array_declarator":
+                    continue
+                name = _declarator_name(source, array)
+                if not name:
+                    continue
+                key = (node.start_byte, name)
+                array_declaration_keys.add(key)
+                if node.type == "parameter_declaration":
+                    continue
+                size_node = array.child_by_field_name("size")
+                expression = (
+                    _fact_expression_text(source, size_node) if size_node is not None else None
+                )
+                fact: dict[str, Any] = {
+                    "source": "declared_array", "unit": "elements",
+                    "expression": expression, "constant": None,
+                    "status": "unknown", "limitation": "",
+                }
+                inner = array.child_by_field_name("declarator")
+                shape = inner
+                while shape is not None and shape.type == "parenthesized_declarator":
+                    shape = _declarator_inner(shape)
+                if shape is not None and shape.type == "array_declarator":
+                    fact["limitation"] = "multidimensional arrays are not modeled in V1"
+                    fact["bytes"] = unknown_bytes(None, fact["limitation"])
+                elif shape is not None and shape.type in {
+                    "pointer_declarator", "reference_declarator",
+                }:
+                    fact.update(
+                        status="unsupported",
+                        limitation="pointer/reference array declarators are not modeled in V1",
+                    )
+                    fact["bytes"] = unknown_bytes(None, fact["limitation"])
+                elif getattr(node, "has_error", False):
+                    fact["limitation"] = "partial or erroneous declaration"
+                    byte_expression = expression
+                    if expression is not None and type_text not in character_types:
+                        byte_expression = _byte_product_expression(
+                            size_node, expression, type_text
+                        )
+                    fact["bytes"] = unknown_bytes(byte_expression, fact["limitation"])
+                elif size_node is None:
+                    fact.update(
+                        status="unsupported",
+                        limitation="flexible or incomplete array has no declared extent",
+                    )
+                    fact["bytes"] = unknown_bytes(None, fact["limitation"])
+                else:
+                    value = _const_int(size_node, source)
+                    if value is None:
+                        fact["limitation"] = (
+                            "non-constant array extent (VLA, macro or unsupported expression)"
+                        )
+                        byte_expression = expression
+                        if expression is not None and type_text not in character_types:
+                            byte_expression = _byte_product_expression(
+                                size_node, expression, type_text
+                            )
+                        fact["bytes"] = unknown_bytes(byte_expression, fact["limitation"])
+                    else:
+                        fact.update(status="constant", constant=value)
+                        if type_text in character_types:
+                            fact["bytes"] = {
+                                "unit": "bytes", "expression": expression,
+                                "constant": value, "status": "constant", "limitation": "",
+                            }
+                        else:
+                            fact["bytes"] = unknown_bytes(
+                                _byte_product_expression(size_node, expression, type_text),
+                                "target ABI element size is not available",
+                            )
+                extents[key] = fact
+        for child in node.named_children:
+            visit(child)
+
+    visit(root)
+    return (
+        extents,
+        array_declaration_keys,
+        value_declaration_types,
+        value_type_definitions,
+        value_type_aliases,
+    )
 
 
 # Node types the name walk passes through without leaving an object behind:

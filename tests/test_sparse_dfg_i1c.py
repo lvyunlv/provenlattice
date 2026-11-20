@@ -846,9 +846,9 @@ class ReachabilityEvidenceContractTests(DfgTestBase):
                 "SELECT feature_version, metadata FROM analysis_state s "
                 "JOIN files f ON f.file_id=s.file_id WHERE f.path='src/contract.c' "
                 "AND s.feature='sparse_dfg:cpp'").fetchone()
-        self.assertEqual(row["feature_version"], 3)
+        self.assertEqual(row["feature_version"], 4)
         metadata = json.loads(row["metadata"])
-        self.assertEqual(metadata["contract"], "cpp-sparse_dfg-v3")
+        self.assertEqual(metadata["contract"], "cpp-sparse_dfg-v4")
 
     def test_may_alias_is_no_longer_a_missing_relation(self) -> None:
         patterns = [
