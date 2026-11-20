@@ -376,7 +376,7 @@ class SparseCfgBuilder:
         # maps skip stale heading declarations and recognize unindexed range-for
         # shadows without changing the index's global semantics.
         self._statement_declaration_scopes: dict[int, Any] = {}
-        self._statement_declaration_names: dict[int, set[str]] = {}
+        self._statement_declaration_names: dict[int, dict[str, int]] = {}
         # The hits grouped by the span of the node that produced them. Two
         # events share one span when one node matches two event types
         # (`free(p)` is both CALL and RELEASE); they chain in type order.
@@ -1618,17 +1618,14 @@ class SparseCfgBuilder:
         ancestor = node.parent
         while ancestor is not None:
             names = self._statement_declaration_names.get(ancestor.start_byte)
-            if names is not None and name in names:
-                declaration_scope = (
-                    self._statement_declaration_scopes.get(declaration.start_byte)
-                    if declaration is not None else None
-                )
-                if declaration_scope is None or (
-                    declaration_scope.start_byte != ancestor.start_byte
+            visible_from = names.get(name) if names is not None else None
+            if visible_from is not None and node.start_byte >= visible_from:
+                if declaration is None or not (
+                    ancestor.start_byte <= declaration.start_byte < ancestor.end_byte
                 ):
-                    # A range-for declarator has no Declaration object in the
-                    # installed grammar. It still shadows an outer array; fail
-                    # closed rather than borrowing that array or inventing an id.
+                    # An unindexed statement/capture declaration still shadows
+                    # an outer array. A real declaration inside this overlay is
+                    # nested more deeply and must retain its own identity.
                     return None
                 break
             ancestor = ancestor.parent
@@ -3300,7 +3297,7 @@ def _statement_local_scope(declaration: Any) -> Any:
 
 def _collect_statement_declaration_scopes(
     root: Any, source: bytes
-) -> tuple[dict[int, Any], dict[int, set[str]]]:
+) -> tuple[dict[int, Any], dict[int, dict[str, int]]]:
     """Index statement-heading names without changing DeclarationIndex.
 
     Ordinary heading declarations already have Declaration objects, but the
@@ -3308,15 +3305,29 @@ def _collect_statement_declaration_scopes(
     `for_range_loop` node. Recording both shapes lets the extent layer reject
     an outer same-named array inside that statement and skip stale heading
     declarations after it, without minting an identity for an unindexed range
-    declarator.
+    declarator. Each name carries its first visible byte: range initializers
+    and structured-binding initializers still belong to the enclosing scope.
     """
     scope_by_declaration: dict[int, Any] = {}
-    names_by_statement: dict[int, set[str]] = {}
+    names_by_statement: dict[int, dict[str, int]] = {}
 
-    def record_name(statement: Any, declarator: Any) -> None:
+    def record_name(statement: Any, declarator: Any, visible_from: int) -> None:
+        if declarator is None:
+            return
+        if declarator.type == "init_declarator":
+            record_name(
+                statement, declarator.child_by_field_name("declarator"), visible_from
+            )
+            return
+        if declarator.type == "structured_binding_declarator":
+            for child in declarator.named_children:
+                if child.type == "identifier":
+                    record_name(statement, child, visible_from)
+            return
         name = _declarator_name(source, declarator)
         if name:
-            names_by_statement.setdefault(statement.start_byte, set()).add(name)
+            names = names_by_statement.setdefault(statement.start_byte, {})
+            names[name] = min(visible_from, names.get(name, visible_from))
 
     def visit(node: Any) -> None:
         if node.type == "declaration":
@@ -3324,9 +3335,37 @@ def _collect_statement_declaration_scopes(
             if statement is not None:
                 scope_by_declaration[node.start_byte] = statement
                 for declarator in node.children_by_field_name("declarator"):
-                    record_name(statement, declarator)
+                    record_name(statement, declarator, node.end_byte)
         elif node.type in {"for_range_loop", "range_based_for_statement"}:
-            record_name(node, node.child_by_field_name("declarator"))
+            body = node.child_by_field_name("body")
+            record_name(
+                node, node.child_by_field_name("declarator"),
+                body.start_byte if body is not None else node.end_byte,
+            )
+        elif node.type == "lambda_expression":
+            # An init-capture declares a new object only inside the lambda body.
+            # It must not hide an outer same-named array, but the initializer
+            # itself remains in the enclosing scope and is therefore excluded.
+            capture = next(
+                (child for child in node.named_children
+                 if child.type == "lambda_capture_specifier"),
+                None,
+            )
+            body = next(
+                (child for child in node.named_children
+                 if child.type == "compound_statement"),
+                None,
+            )
+            if capture is not None and body is not None:
+                for initializer in capture.named_children:
+                    if initializer.type != "lambda_capture_initializer":
+                        continue
+                    name = next(
+                        (child for child in initializer.named_children
+                         if child.type == "identifier"),
+                        None,
+                    )
+                    record_name(body, name, body.start_byte)
         for child in node.named_children:
             visit(child)
 
@@ -3347,6 +3386,66 @@ def _parent_through_parentheses(node: Any) -> tuple[Any, Any]:
         current = parent
         parent = current.parent
     return current, parent
+
+
+def _cpp_reference_cast_transparency(
+    current: Any, parent: Any, source: bytes
+) -> bool | None:
+    """Whether a cast preserves a builtin lvalue for outer WRITE propagation.
+
+    ``True`` accepts only a C-style cast to a primitive lvalue reference or the
+    equivalent ``static_cast``. ``False`` rejects a recognized reference cast
+    whose semantics V1 cannot prove. ``None`` means this is not a reference
+    cast, so ordinary READ handling can continue.
+    """
+    type_node = None
+    cast_name = ""
+    if parent.type == "cast_expression":
+        value = parent.child_by_field_name("value")
+        if value is None or _span(value) != _span(current):
+            return None
+        type_node = parent.child_by_field_name("type")
+    elif parent.type == "call_expression":
+        function = parent.child_by_field_name("function")
+        arguments = parent.child_by_field_name("arguments")
+        if function is None or function.type != "template_function" or arguments is None:
+            return None
+        if len(arguments.named_children) != 1 or (
+            _span(arguments.named_children[0]) != _span(current)
+        ):
+            return None
+        identifier = next(
+            (child for child in function.named_children if child.type == "identifier"),
+            None,
+        )
+        template = next(
+            (child for child in function.named_children
+             if child.type == "template_argument_list"),
+            None,
+        )
+        if identifier is None or template is None or len(template.named_children) != 1:
+            return None
+        cast_name = _text_of(source, identifier)
+        if cast_name not in {"static_cast", "const_cast", "reinterpret_cast", "dynamic_cast"}:
+            return None
+        type_node = template.named_children[0]
+    else:
+        return None
+
+    if type_node is None or type_node.type != "type_descriptor":
+        return None
+    references = [
+        child for child in type_node.named_children
+        if child.type == "abstract_reference_declarator"
+    ]
+    if not references:
+        return None
+    if len(references) != 1 or _text_of(source, references[0]) != "&":
+        return False
+    is_builtin = any(child.type == "primitive_type" for child in type_node.named_children)
+    if is_builtin and (parent.type == "cast_expression" or cast_name == "static_cast"):
+        return True
+    return False
 
 
 def _semantic_access_kind(
@@ -3418,6 +3517,22 @@ def _semantic_access_kind(
                 return None
             current, parent = _parent_through_parentheses(outer)
             continue
+        if cpp and parent.type == "argument_list" and (
+            parent.parent is not None and parent.parent.type == "call_expression"
+        ):
+            # Named C++ casts wrap their sole value in an argument_list. Let the
+            # reference-cast check below inspect the cast itself; ordinary calls
+            # remain non-transparent and fall through to READ.
+            parent = parent.parent
+        if cpp:
+            reference_cast = _cpp_reference_cast_transparency(current, parent, source)
+            if reference_cast is True:
+                current, parent = _parent_through_parentheses(parent)
+                continue
+            if reference_cast is False:
+                # A user-defined or otherwise unproven reference cast need not
+                # preserve the source element. Do not default its access to READ.
+                return None
         break
 
     if carrier_event_type != "DEREFERENCE":
@@ -3592,6 +3707,10 @@ def _memory_call_facts(node: Any, matched_name: str, source: bytes) -> dict[str,
         return None
     callee_text = _fact_expression_text(source, function)
     callee = _callee_leaf(callee_text or matched_name)
+    if function.type == "qualified_identifier" and callee_text != f"std::{callee}":
+        # Same-named functions in user namespaces do not inherit the standard
+        # memory API's semantics. Only the exact std::<leaf> spelling is V1.
+        return None
     if callee not in _MEMORY_LENGTH_ARG:
         return None
     args = _call_argument_nodes(node)

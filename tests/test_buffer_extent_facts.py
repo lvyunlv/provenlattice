@@ -283,6 +283,48 @@ void cpp_overloaded_comma_write(void) {
     OverloadedCommaWrite q;
     (q, comma_array[1]) = 2;
 }
+struct ReviewPair { int *a; int *b; };
+namespace N {
+void memset(char *, int, unsigned long) {}
+}
+void reviewer_scope_cast_and_memory_regressions(char *p) {
+    ReviewPair pairs[1];
+    char a[8];
+    int numbers[4];
+    for (auto [a, b] : pairs) {
+        a[0] = 1;
+    }
+    [a = p] {
+        a[0] = 1;
+    }();
+    ((int&)numbers[0]) = 1;
+    static_cast<int&>(numbers[1]) = 2;
+    N::memset(a, 0, 4);
+    std::memset(a, 0, 4);
+}
+ReviewPair make_review_pair(int);
+struct ReviewPairRange {
+    ReviewPair *begin();
+    ReviewPair *end();
+};
+void reviewer_structured_binding_scope(void) {
+    ReviewPair pairs[1];
+    ReviewPairRange ranges[1];
+    char a[8];
+    if (auto [a, b] = make_review_pair(a[1]); true) {
+        a[0] = 3;
+    }
+    for (auto [a, b] : ranges[a[0]]) {
+        a[0] = 4;
+    }
+}
+void reviewer_lambda_capture_nested_scope(void) {
+    char a[8];
+    [a = &a[0]] {
+        a[0] = 1;
+        { int a[4]; a[0] = 2; }
+    }();
+}
 struct OverloadedElementAddress {
     int *operator&();
     void operator=(int);
@@ -1016,6 +1058,99 @@ class BufferExtentFactsTests(unittest.TestCase):
             event = self.event("DEREFERENCE", matched_name, "src/regressions.cpp")
             self.assertNotIn("memory_access_v1", event.get("annotations", {}))
             self.assertEqual(self.fact(event, "buffer_extent_v1")["constant"], 4)
+
+    def test_cpp_structured_binding_and_init_capture_hide_outer_array(self) -> None:
+        self.materialize()
+        events = [
+            event for event in self.events("src/regressions.cpp")
+            if event["owner_qualified_name"]
+            == "reviewer_scope_cast_and_memory_regressions"
+            and event["matched_name"] == "a[0]"
+        ]
+        self.assertEqual(len(events), 2)
+        for event in events:
+            extent = self.fact(event, "buffer_extent_v1")
+            self.assertEqual(extent["source"], "unknown")
+            self.assertIsNone(extent["constant"])
+            self.assertEqual(extent["object"]["decl"], "")
+            self.assertEqual(extent["object"]["storage"], "unknown")
+
+    def test_cpp_structured_binding_visibility_excludes_initializers(self) -> None:
+        self.materialize()
+        relative = "src/regressions.cpp"
+        lines = SOURCES[relative].splitlines()
+        events = {
+            lines[event["start_line"] - 1].strip(): event
+            for event in self.events(relative)
+            if event["owner_qualified_name"] == "reviewer_structured_binding_scope"
+            and event["event_type"] == "DEREFERENCE"
+            and event["matched_name"] == "a[0]"
+        }
+        expectations = {
+            "a[0] = 3;": None,
+            "for (auto [a, b] : ranges[a[0]]) {": 8,
+            "a[0] = 4;": None,
+        }
+        self.assertEqual(set(events), set(expectations))
+        for line, constant in expectations.items():
+            extent = self.fact(events[line], "buffer_extent_v1")
+            self.assertEqual(extent["constant"], constant, line)
+            if constant is None:
+                self.assertEqual(extent["source"], "unknown", line)
+                self.assertEqual(extent["object"]["decl"], "", line)
+
+    def test_cpp_lambda_capture_allows_nested_array_redeclaration(self) -> None:
+        self.materialize()
+        relative = "src/regressions.cpp"
+        lines = SOURCES[relative].splitlines()
+        events = {
+            lines[event["start_line"] - 1].strip(): event
+            for event in self.events(relative)
+            if event["owner_qualified_name"] == "reviewer_lambda_capture_nested_scope"
+            and event["event_type"] == "DEREFERENCE"
+        }
+        expectations = {
+            "[a = &a[0]] {": 8,
+            "a[0] = 1;": None,
+            "{ int a[4]; a[0] = 2; }": 4,
+        }
+        self.assertEqual(set(events), set(expectations))
+        for line, constant in expectations.items():
+            extent = self.fact(events[line], "buffer_extent_v1")
+            self.assertEqual(extent["constant"], constant, line)
+            if constant is None:
+                self.assertEqual(extent["object"]["decl"], "", line)
+            else:
+                self.assertEqual(extent["object"]["decl"], "local:a", line)
+
+    def test_cpp_builtin_reference_cast_preserves_outer_write(self) -> None:
+        self.materialize()
+        for name in ("numbers[0]", "numbers[1]"):
+            event = self.event("DEREFERENCE", name, "src/regressions.cpp")
+            self.assertEqual(self.fact(event, "memory_access_v1")["access"], "WRITE")
+
+    def test_only_unqualified_or_std_memory_api_has_length_fact(self) -> None:
+        self.materialize()
+        relative = "src/regressions.cpp"
+        lines = SOURCES[relative].splitlines()
+        calls = {
+            lines[event["start_line"] - 1].strip(): event
+            for event in self.events(relative)
+            if event["owner_qualified_name"]
+            == "reviewer_scope_cast_and_memory_regressions"
+            and event["event_type"] == "CALL"
+        }
+        custom = calls["N::memset(a, 0, 4);"]
+        self.assertNotIn("memory_access_v1", custom.get("annotations", {}))
+        standard = calls["std::memset(a, 0, 4);"]
+        fact = self.fact(standard, "memory_access_v1")
+        self.assertEqual(fact["kind"], "memory_length")
+        self.assertEqual(fact["function"], "std::memset")
+        self.assertEqual(fact["expression"], "4")
+        self.assertEqual(fact["unit"], "bytes")
+        self.assertEqual(fact["status"], "constant")
+        self.assertEqual(fact["constant"], 4)
+        self.assertEqual(fact["object"]["decl"], "local:a")
 
     def test_cpp_memory_destination_conversion_does_not_preserve_object(self) -> None:
         self.materialize()

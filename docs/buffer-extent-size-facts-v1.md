@@ -152,8 +152,12 @@ that statement: the extent-only scope overlay skips the stale declaration and
 continues resolving outward, so a visible outer array is still found. The
 installed grammar's unindexed range-for declarator is the conservative
 exception: inside that statement it yields unknown/empty object identity rather
-than borrowing an outer array or minting a declaration id. Arbitrary member
-paths and cast/computed array bases remain unsupported. In particular,
+than borrowing an outer array or minting a declaration id. Structured bindings
+and lambda init-captures likewise shadow an outer same-spelled array without
+acquiring its extent or declaration identity; their actual bound/captured type
+is outside V1. Range initializers and capture initializers remain in the enclosing
+scope, while a new nested local declaration takes precedence over the capture
+overlay. Arbitrary member paths and cast/computed array bases remain unsupported. In particular,
 `((unsigned char *)a)[i]` cannot reuse `a`'s element count with a differently
 typed subscript.
 
@@ -307,10 +311,14 @@ C propagates an outer lvalue write through the value-producing right operand
 of a built-in comma, but C++ does not propagate through comma expressions:
 overloaded `operator,` can return an unrelated reference. The underlying
 array's declared extent may remain available even when no value-access fact
-is emitted for these C++ shapes. For the same reason, a subscript/pointer-offset
-expression whose resolved element type is class-like has no V1 value-access
-annotation: overloaded assignment and conversion operators are outside this
-contract, while the declared array extent remains a valid fact.
+is emitted for these C++ shapes. A C-style or `static_cast` cast to a primitive
+lvalue reference preserves an outer write, as in `((int&)a[i]) = 0` and
+`static_cast<int&>(a[i]) = 0`. Other reference casts do not propagate direction
+and omit the value-access fact rather than guessing READ or WRITE. For the same
+reason, a subscript/pointer-offset expression whose resolved element type is
+class-like has no V1 value-access annotation: overloaded assignment and
+conversion operators are outside this contract, while the declared array extent
+remains a valid fact.
 
 Both tree-sitter spellings are supported: C's `index` and C++'s `indices`.
 Every successfully parsed single index expression is retained, including
@@ -361,8 +369,11 @@ annotation.
 
 ### 5.3 Memory-API length
 
-Direct `memcpy`, `memmove`, and `memset` CALL nodes emit
-`kind="memory_length"`, `access="CALL"`, and `unit="bytes"`. `function` retains
+Direct unqualified `memcpy`, `memmove`, and `memset` CALL nodes, plus their exact
+`std::memcpy`, `std::memmove`, and `std::memset` spellings, emit
+`kind="memory_length"`, `access="CALL"`, and `unit="bytes"`. Other qualified
+spellings such as `N::memset` have no memory-length fact: a same-leaf function in
+another namespace does not inherit the standard API's semantics. `function` retains
 the callee spelling, and the common value fields describe the third argument.
 The `object` is resolved independently from the first (destination) argument;
 it never reuses an outer assignment's result variable. Thus
@@ -424,7 +435,8 @@ No defect query or defect category consumes these annotations in V1. In
 particular, an extent of 4 plus an index of 4 is only a pair of facts; it does not
 create a candidate. The targeted Golden suite covers constants, dynamic values,
 unknown/unsupported shapes, C/C++ identity, nested and statement-local scope,
-range-for shadowing, parenthesized declarators, explicit this-member resolution,
+range-for/structured-binding/init-capture shadowing, parenthesized declarators,
+explicit this-member resolution, reference-cast access direction,
 cast/octal handling, bounded integer overflow/shift failures, commuted
 subscripts, cast array bases, member/conditional and unevaluated access
 direction, RMW, direct allocation result binding, C++ overload/conversion
