@@ -1,23 +1,29 @@
-# Skill 消费契约 — 图谱事实 / 证据词汇与消费纪律（V1）
+# Skill 消费契约 — 图谱事实 / 证据词汇与消费纪律（V1 / IR V2）
 
 > 面向消费方 skill `ai-scan-concurrency`（independent extract 1.0.0）维护者。
 > 本文档是 **skill 侧「消费契约」**，规范 skill 应当如何消费 ProvenLattice 图谱产出；
 > 它 **不改变** 图谱任何生产/投影语义。图谱侧的「生产契约」是 FactBundle v2.1 schema 与
-> Canonical Evidence IR V1 schema（见 `src/provenlattice/evidence_projection/schema/`）。
+> Canonical Evidence IR V1 / IR V2 schema（见 `src/provenlattice/evidence_projection/schema/`）。
 >
-> 版本：`skill-interface-requirements-v1` · 对应 Issue #86（Agent/Skill API V1，阶段③ / 走法 B）。
+> 版本：`skill-interface-requirements-v1` · 对应 Issue #86（Agent/Skill API V1，阶段③ / 走法 B）
+> 与 Issue #87（Canonical Evidence IR V2 + 五类并发事实 additive 投影）。
 > 本文档只提需求，**不修改 SKILL.md 本体**。
 
 ## 0. 消费入口
 
 | 入口 | 位置 | 返回 |
 |---|---|---|
-| 能力清单 | `provenlattice.evidence_projection.skill_api.list_skill_capabilities()` | 按 `defect_type` 组织的机器可读 manifest（`projected_facts` / `projected_evidence` / `not_projected_facts` / `not_produced_facts`） |
-| 证据接口 | `provenlattice.evidence_projection.skill_api.resolve_evidence(case_workdir, database, *, defect_type, target_symbols=(), run_context=None, **kwargs)` | 经 `validate_evidence_ir_v1` 校验通过的 Canonical Evidence IR V1 dict |
+| 能力清单 | `provenlattice.evidence_projection.skill_api.list_skill_capabilities()` | 按 `defect_type` 组织的机器可读 manifest（`projected_facts` / `projected_evidence` / `not_projected_facts` / `not_produced_facts`），顶层另含 `ir_versions_supported` 与 `ir_v2`（IR V2 能力目录） |
+| 证据接口 | `provenlattice.evidence_projection.skill_api.resolve_evidence(case_workdir, database, *, defect_type, target_symbols=(), run_context=None, ir_version="1", enable_deref=False, file_path=None, **kwargs)` | 经版本对应校验器（`validate_evidence_ir_v1` 或 `validate_evidence_ir_v2`）校验通过的 IR dict |
 
 `resolve_evidence` 是薄 facade：`Registry → adapter → IR`，**不**重新实现投影。异常为 fail-closed：
 未知 `defect_type` 抛 `UnknownDefectTypeError`；投影内部异常原样上抛；IR 校验失败抛
 `EvidenceIRValidationError`，绝不返回未通过校验的 IR。
+
+**版本协商（显式、fail-closed）**：`ir_version="1"`（缺省）返回冻结 IR V1；`ir_version="2"`
+显式进入 IR V2（五类并发事实 additive 投影，需 `file_path`）；任何其它值抛
+`UnknownIRVersionError`。**禁止按消费者能力自动猜测版本**，两条转换链路独立、分别校验、
+互不修改返回对象（见 §6）。
 
 ## 1. 事实 / 证据词汇 ↔ skill §4 字段映射
 
@@ -80,6 +86,7 @@ skill 消费时：**语义判断**读 `facts` 面；**源码定位与溯源**读
 | `common_locks` | `produced_not_projected` | `lock_identity` 可 inexact/unresolved；SAME/DIFFERENT 仅同一 subject 访问对间；RAII 保持 ambiguous |
 | `spawn_join` | `produced_not_projected` | 需 handle_decl 相等 + 同 owner + spawn-before-join；否则不配对；WaitForMultipleObjects → unknown |
 | `happens_before` | `not_produced` | 图谱**无**一阶 HB relation；IR V1 `relations==[]`；不得虚构 HB 事实 |
+| `guarded_by` | `not_produced` | 图谱**无**一阶 GUARDED_BY relation；`held_locks`（逐点持有、恒 ambiguous）与 `protect`（锁保护访问）均**不**升级为字段级 GUARDED_BY 不变量；`protect` ≠ `guarded_by` |
 | `interprocedural_path` | `produced_not_projected` | MAY_CALL fail-closed（仅 unique_same_file_assignment 给目标，ambiguous → []）；DEREF_RESOLVES_TO 受限消费 |
 
 补充：`release_sites` 是 double_free 缺陷的已投影事实类型（`access_type=RELEASE`），不在 skill
@@ -115,8 +122,56 @@ skill 消费时：**语义判断**读 `facts` 面；**源码定位与溯源**读
 
 ## 5. 依赖闭环与边界
 
-- 本文档只依赖图谱已交付的三层：Registry（#83）、Canonical Evidence IR V1（#79）、
-  FactBundle v2.1（#78）。不依赖、不 import skill 本体。
+- 本文档只依赖图谱已交付的四层：Registry（#83）、Canonical Evidence IR V1（#79）、
+  FactBundle v2.1（#78），以及 Canonical Evidence IR V2（#87，见 §6）。不依赖、不 import
+  skill 本体。
 - 图谱侧不变：本文档不改 `source.py` / `projection.py` / `adapter.py` / `constants.py` /
   `factbundle_v2_1.schema.json`，不改 `ir.py` / `evidence_ir_v1.schema.json`，不触及
   Engine / parser / CFG / DFG / alias / HB / GT / Prompt / Skill / Scorer。
+
+## 6. Canonical Evidence IR V2（#87）— 五类并发事实 additive 投影
+
+IR V2 是 **新增的独立 IR**（`ir_schema_version="2"`，`run.projector_version="2"`），与冻结的
+IR V1 并行，二者均不互相改写返回对象。它打通「候选识别之前即存在的**文件级**图谱事实」到
+「Agent 可消费证据」之间的断层：File-level 事实/关系的 `candidate_id` 为 `null`（**不**表示
+证据无效），候选绑定事实（`shared_access`）才引用真实候选 id。
+
+### 6.1 类型化 Facts（6 类）与 Relations（8 类）
+
+五类 skill 命名事实被分解为子结构级类型（字段映射逐项来源见映射矩阵）：
+
+| 分类 | 类型 | 来源（Engine 生产入口） | confidence 约束 |
+|---|---|---|---|
+| Fact | `thread_entry_point` | `build_concurrency_context`（`thread_entry_points`） | `definite` |
+| Fact | `thread_spawn` | 同上（`spawns`） | `definite` |
+| Fact | `thread_join` | 同上（`joins`） | `definite` |
+| Fact | `resource_lifetime` | 同上（`resource_lifetime`） | `candidate` |
+| Fact | `may_parallel` | 同上（`may_parallel`） | `ambiguous`/`unresolved`（**永不 definite**） |
+| Fact | `held_locks` | `build_access_lockset`（`access_locksets`） | `ambiguous`（**永不 definite**） |
+| Fact | `shared_access` | FactBundle v2.1 基线（候选绑定） | `definite` |
+| Relation | `spawn_join` | `build_concurrency_context`（`spawn_join_pairs`） | `definite`（仅 handle_decl+owner+顺序齐备） |
+| Relation | `protect` | `build_access_lockset`（`PROTECTS`） | `ambiguous` |
+| Relation | `unlock_omitted_on_path` | 同上（`UNLOCK_OMITTED_ON_PATH`） | `ambiguous` |
+| Relation | `same_lock` | 同上（`SAME_LOCK`） | `ambiguous` |
+| Relation | `different_lock` | 同上（`DIFFERENT_LOCK`） | `ambiguous` |
+| Relation | `may_call` | `build_call_relation`（`call_relations`） | `unknown`/`unique_same_file_assignment`/`ambiguous_multiple_assignments` |
+| Relation | `deref_resolves_to` | `build_deref_resolution`（`deref_resolves_to`） | `must`/`may`/`unknown`（三态，**不互升**） |
+| Relation | `same_storage` | 同上（`same_storage`） | `must`（仅跨 owner 且双方 must） |
+
+### 6.2 语义限制（必查，M4/M9）
+
+- `held_locks` 是「锁在此访问上被持有」的**逐点观测**（Fact），`protect` 是「锁保护此访问」的
+  Relation；**二者都不合成 GUARDED_BY**。
+- `spawn_join` 是配对/协调关系（spawn-before-join），**不**合成 HAPPENS_BEFORE；排序证据仅由
+  `spawn_join` + `may_parallel` 间接表示。
+- `may_parallel` 恒为候选（`ambiguous`/`unresolved`），**永不**升级为确定并发结论。
+- `coverage.not_produced == ["happens_before", "guarded_by"]` 显式列出，relations 中不出现二者。
+- **DEREF 默认 OFF**：仅 `enable_deref=True` 才消费 `deref_resolves_to`/`same_storage`；
+  `must`/`may`/`unknown` 三态不得互相升级（尤其 `may` 不升 `must`），解析失败不降级为猜测关系。
+  manifest 的 `ir_v2.deref.default == "disabled"` 明确披露该默认关闭状态。
+
+### 6.3 消费升级不必改 V1 路径
+
+IR V2 仅经显式 `ir_version="2"` + `file_path` 到达，缺省仍是 IR V1（§0）。新增事实只落在 IR V2
+的 `facts`/`relations`/`coverage`/`limitations`，不改写、不删除 IR V1 任何字段；旧 IR V1 消费者
+（不改 `ir_version`）不受影响。

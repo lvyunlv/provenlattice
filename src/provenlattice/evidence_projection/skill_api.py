@@ -1,41 +1,59 @@
-"""Agent/Skill API V1 (Issue #86).
+"""Agent/Skill API (Issue #86 -> #87 dual IR path).
 
 A thin, read-only, deterministic facade over the already-delivered evidence
-projection chain. It composes the three lower layers without re-implementing
-any projection logic:
+projection chain. It composes the lower layers without re-implementing any
+projection logic, and exposes two independent, separately-validated IR paths
+selected by an explicit ``ir_version`` token:
 
-    Registry (``registry.REGISTRY``)
-        -> adapter (``adapter.analyze_*``)
-        -> Canonical Evidence IR V1 (``ir.factbundle_v2_1_to_ir``)
+    ir_version="1" (default, frozen #79/#86):
+        Registry (``registry.REGISTRY``)
+            -> adapter (``adapter.analyze_*``)
+            -> Canonical Evidence IR V1 (``ir.factbundle_v2_1_to_ir``)
+
+    ir_version="2" (#87, additive file-level concurrency facts):
+        Registry (fail-closed gate only)
+            -> ``ir_v2_source.assemble_ir_v2_input`` (engine readers)
+            -> Canonical Evidence IR V2 (``ir_v2.assemble_ir_v2``)
 
 Public surface:
 
 * :func:`list_skill_capabilities` -- the truthful, machine-readable capability
-  manifest, organised per ``defect_type`` (section B of Issue #86).
-* :func:`resolve_evidence`       -- Registry -> adapter -> IR composition that
-  returns a validated Canonical Evidence IR V1 dict (section A of Issue #86).
+  manifest, organised per ``defect_type`` (section B of Issue #86), extended
+  with ``ir_versions_supported`` and the IR V2 capability catalog (#87).
+* :func:`resolve_evidence`       -- version-dispatched composition that returns
+  a validated Canonical Evidence IR V1 (default) or IR V2 dict.
 
-Positioning: this stage (stage 3, approach B) ships only the *thin interface +
-capability manifest + skill requirements doc*. It does NOT implement the
-additive projection of the six concurrency fact classes (a separate Issue),
-does NOT wire the skill into the graph, and does NOT modify the skill body.
+Positioning: this stage ships the *thin interface + capability manifest + skill
+requirements doc* (Issue #86) and the additive projection of the five concurrency
+fact classes via the parallel IR V2 (Issue #87). It does NOT wire the skill into
+the graph and does NOT modify the skill body, Engine, GATE-0 v2.1 or IR V1.
 
 Contract constraints honoured
 -----------------------------
 
-* **pure facade** -- ``resolve_evidence`` calls
+* **pure facade** -- the V1 path calls
   ``registry.REGISTRY.get_projector(defect_type).analyze(...)`` and feeds the
   result to ``ir.factbundle_v2_1_to_ir``; it never re-projects, never injects
-  defaults, and never rewrites the FactBundle or the IR.
+  defaults, and never rewrites the FactBundle or the IR. The V2 path reuses the
+  engine's own ``query_*`` / ``build_*`` readers (never re-implements analysis)
+  and feeds the normalised input record to the pure ``ir_v2`` transformer.
 * **argument forwarding** -- ``target_symbols`` and ``**kwargs`` are forwarded
-  verbatim to ``Projector.analyze`` (as in #83); ``run_context`` is supplied
-  *only* to ``factbundle_v2_1_to_ir`` as run metadata (C2 of #79) and never
-  participates in projection.
+  verbatim to the V1 ``Projector.analyze`` (as in #83); ``run_context`` is
+  supplied *only* as run metadata (C2 of #79) and never participates in
+  projection. They do not participate in the V2 path.
+* **version negotiation (explicit, fail-closed)** -- ``ir_version`` is an
+  explicit token with no consumer-capability guessing and no silent fallback:
+  ``"1"`` (default) keeps #86 byte-for-byte; ``"2"`` selects IR V2; any other
+  value raises :class:`UnknownIRVersionError`. The two chains are independent
+  and separately validated; V2 never mutates a V1 return object.
+* **DEREF default OFF** -- ``enable_deref`` defaults to ``False``; the
+  ``deref_resolves_to`` three-state (``must``/``may``/``unknown``) never
+  cross-upgrades and a failed resolution never degrades to a guessed relation.
 * **fail-closed** -- an unknown ``defect_type`` propagates
   ``registry.UnknownDefectTypeError``; an exception inside ``Projector.analyze``
   is re-raised verbatim (never downgraded to an empty bundle); an IR that fails
-  ``ir.validate_evidence_ir_v1`` raises :class:`EvidenceIRValidationError` and
-  is never returned to the skill.
+  its version validator raises :class:`EvidenceIRValidationError` and is never
+  returned to the skill.
 * **version boundary** -- the facade reads ``Projector.projector_version`` for
   the manifest but never writes/overwrites IR V1's ``run.projector_version``,
   which stays frozen at ``ir.PROJECTOR_VERSION`` (``"NOT_APPLICABLE"``).
@@ -44,11 +62,14 @@ Contract constraints honoured
   (evidence/anchor location structures ``supporting_locations[]`` /
   ``evidence_locations[]``); ``not_projected_facts`` (a producer exists but is
   not projected) is kept distinct from ``not_produced_facts`` (no first-order
-  producer). ``produced_not_projected`` only describes projection status and
-  never promises the fact appears for any specific case.
+  producer, incl. ``happens_before`` and ``guarded_by``). ``produced_not_projected``
+  only describes projection status and never promises the fact appears for any
+  specific case.
 
-This module imports only ``registry`` / ``constants`` / ``ir`` and the standard
-library. It never imports the engine, GT, Prompt, Skill or Scorer, and it never
+This module imports ``registry`` / ``ir`` / ``ir_v2`` (pure, no engine) and the
+standard library at module level; ``ir_v2_source`` (the only engine-importing
+module) is imported lazily inside the V2 path so the V1 path and the manifest
+never load the engine. It never imports GT, Prompt, Skill or Scorer, and it never
 mutates any input.
 """
 
@@ -57,6 +78,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from . import ir
+from . import ir_v2
 from . import registry
 
 
@@ -67,7 +89,19 @@ class EvidenceIRValidationError(RuntimeError):
     """
 
 
+class UnknownIRVersionError(ValueError):
+    """An unsupported ``ir_version`` was requested (fail-closed).
+
+    ``ir_version`` is an explicit version negotiation token; there is no
+    silent fallback and no consumer-capability guessing (#87 decision 2).
+    """
+
+
 MANIFEST_VERSION = "1"
+
+# The IR versions the facade can produce. ``"1"`` (frozen IR V1, Issue #79/#86)
+# and ``"2"`` (IR V2, Issue #87, additive concurrency facts).
+IR_VERSIONS_SUPPORTED = ("1", "2")
 
 # ---------------------------------------------------------------------------
 # frozen FactBundle v2.1 / IR V1 contract surface (mirrors the schemas)
@@ -189,6 +223,16 @@ _NOT_PRODUCED_FACTS = {
             "fabricate HB facts"
         ),
     },
+    "guarded_by": {
+        "status": "not_produced",
+        "note": (
+            "no first-order GUARDED_BY relation; the graph projects held_locks "
+            "(a per-access must-hold lock set, always ambiguous) as a fact and "
+            "the lock->access 'protect' relation, but neither is promoted to a "
+            "field-guarding GUARDED_BY invariant; 'protect' is not an automatic "
+            "GUARDED_BY equivalence (#87 decision 4)"
+        ),
+    },
 }
 
 # double_free projects one semantic fact type: the candidate's release sites.
@@ -261,6 +305,26 @@ STATUS_SEMANTICS = {
 }
 
 
+# The IR V2 capability catalog (Issue #87). The IR V2 path (``ir_version="2"``)
+# exposes six truthfully-decomposed fact types and eight relation types.
+_IR_V2_CATALOG = {
+    "fact_types": list(ir_v2.FACT_TYPES),
+    "relation_types": list(ir_v2.RELATION_TYPES),
+    "not_produced": list(ir_v2.NOT_PRODUCED),
+    "deref": {
+        "default": "disabled",
+        "enable_param": "enable_deref",
+        "confidence_states": ["must", "may", "unknown"],
+        "note": (
+            "DEREF_RESOLVES_TO is restricted (#48) and default OFF; enable via "
+            "enable_deref=True. must/may/unknown are three-state and never "
+            "cross-upgrade (may is never upgraded to must); a failed resolution "
+            "is never degraded to a guessed relation."
+        ),
+    },
+}
+
+
 def _defect_manifest(defect_type: str, projector_version: str) -> dict[str, Any]:
     """The truthful per-defect manifest block.
 
@@ -305,6 +369,8 @@ def list_skill_capabilities() -> dict[str, Any]:
 
     return {
         "manifest_version": MANIFEST_VERSION,
+        "ir_versions_supported": list(IR_VERSIONS_SUPPORTED),
+        "ir_v2": _IR_V2_CATALOG,
         "defect_types": defect_types,
         "anchor_semantics": ANCHOR_SEMANTICS,
         "status_semantics": STATUS_SEMANTICS,
@@ -318,23 +384,55 @@ def resolve_evidence(
     defect_type: str,
     target_symbols=(),
     run_context: Mapping[str, Any] | None = None,
+    ir_version: str = "1",
+    enable_deref: bool = False,
+    file_path: str | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Compose Registry -> adapter -> IR and return a validated IR V1 dict.
+    """Compose Registry -> adapter -> IR and return a validated IR dict.
 
-    ``target_symbols`` and ``**kwargs`` are forwarded verbatim to
-    ``Projector.analyze`` (no truncation / rewrite / default injection).
-    ``run_context`` is supplied *only* to ``factbundle_v2_1_to_ir`` as the
-    out-of-band run metadata (``code_revision`` / ``engine_version`` /
-    ``db_snapshot_identity``); it never participates in projection.
+    Version negotiation (#87 decision 2):
 
-    Fail-closed behaviour:
+    * ``ir_version="1"`` (default) -> frozen IR V1 (Issue #79/#86), unchanged;
+    * ``ir_version="2"`` -> IR V2 (Issue #87) additive file-level concurrency
+      facts; requires ``file_path`` and honours ``enable_deref`` (default OFF);
+    * any other value -> :class:`UnknownIRVersionError` (fail-closed, no
+      consumer-capability guessing, no silent fallback).
 
-    * unknown ``defect_type`` -> ``registry.UnknownDefectTypeError``;
-    * exception inside ``Projector.analyze`` -> re-raised verbatim;
-    * IR fails ``ir.validate_evidence_ir_v1`` -> :class:`EvidenceIRValidationError`
-      (the invalid IR is never returned).
+    The two version chains are independent and separately validated: IR V2 never
+    mutates an IR V1 return object, and IR V1 behaviour is byte-for-byte
+    unchanged. ``target_symbols`` and ``**kwargs`` are forwarded verbatim to the
+    IR V1 ``Projector.analyze`` (they do not participate in the IR V2 path).
+
+    Fail-closed behaviour (both paths): unknown ``defect_type`` ->
+    ``registry.UnknownDefectTypeError``; an exception inside ``Projector.analyze``
+    -> re-raised verbatim; an IR that fails its version validator ->
+    :class:`EvidenceIRValidationError` (never returned to the skill).
     """
+    if ir_version == "1":
+        return _resolve_evidence_v1(
+            case_workdir, database, defect_type=defect_type,
+            target_symbols=target_symbols, run_context=run_context, **kwargs)
+    if ir_version == "2":
+        return _resolve_evidence_v2(
+            case_workdir, database, defect_type=defect_type,
+            file_path=file_path, enable_deref=enable_deref,
+            run_context=run_context)
+    raise UnknownIRVersionError(
+        "unknown ir_version: %r (supported: %r)"
+        % (ir_version, IR_VERSIONS_SUPPORTED))
+
+
+def _resolve_evidence_v1(
+    case_workdir,
+    database,
+    *,
+    defect_type: str,
+    target_symbols,
+    run_context: Mapping[str, Any] | None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """IR V1 path (Issue #86 behaviour, unchanged)."""
     projector = registry.REGISTRY.get_projector(defect_type)
     bundle = projector.analyze(case_workdir, database, target_symbols, **kwargs)
     evidence = ir.factbundle_v2_1_to_ir(bundle, run_context=run_context)
@@ -348,9 +446,40 @@ def resolve_evidence(
     return evidence
 
 
+def _resolve_evidence_v2(
+    case_workdir,
+    database,
+    *,
+    defect_type: str,
+    file_path: str | None,
+    enable_deref: bool,
+    run_context: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """IR V2 path (additive concurrency facts; independent of the V1 chain)."""
+    # Fail-closed on an unknown defect_type (same gate as V1); the V2 path then
+    # reads the file-level analyzers directly and never invokes the projector.
+    registry.REGISTRY.get_projector(defect_type)
+    from . import ir_v2_source
+
+    input_record = ir_v2_source.assemble_ir_v2_input(
+        case_workdir, database, file_path=file_path,
+        enable_deref=enable_deref, defect_type=defect_type)
+    evidence = ir_v2.assemble_ir_v2(input_record, run_context=run_context)
+
+    problems = ir_v2.validate_evidence_ir_v2(evidence)
+    if problems:
+        raise EvidenceIRValidationError(
+            "resolve_evidence (ir_version=2) produced an IR that failed "
+            "validation: %r" % (problems,))
+
+    return evidence
+
+
 __all__ = [
     "MANIFEST_VERSION",
+    "IR_VERSIONS_SUPPORTED",
     "EvidenceIRValidationError",
+    "UnknownIRVersionError",
     "list_skill_capabilities",
     "resolve_evidence",
 ]

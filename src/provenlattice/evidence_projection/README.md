@@ -264,6 +264,76 @@ registered on an independent `Registry()` and never enters the production
 `REGISTRY` or the FactBundle `defect_type` schema enum. Test coverage lives in
 `tests/test_evidence_registry.py`.
 
+## Canonical Evidence IR V2 + Skill API V1 (Issues #86, #87)
+
+`skill_api.py` (Issue #86) adds the thin Agent/Skill API facade: a truthful
+`list_skill_capabilities()` manifest plus version-dispatched
+`resolve_evidence(...)`. Issue #87 adds, additively and in parallel to the frozen
+IR V1, the **Canonical Evidence IR V2** (`ir_v2.py` + `ir_v2_source.py`) that
+projects the five file-level concurrency fact classes (already produced by the
+graph, never before projected) into typed Facts and Relations.
+
+### Version negotiation (decision 2)
+
+```python
+from provenlattice.evidence_projection import skill_api
+
+evidence1 = skill_api.resolve_evidence(workdir, db, defect_type="race_condition")      # IR V1 (default)
+evidence2 = skill_api.resolve_evidence(workdir, db, defect_type="race_condition",
+                                       ir_version="2", file_path="src/t.c")            # IR V2
+manifest  = skill_api.list_skill_capabilities()                                        # + ir_versions_supported / ir_v2
+```
+
+`ir_version` defaults to `"1"` (frozen #86 behaviour, byte-for-byte). `"2"`
+explicitly selects IR V2; any other value raises `UnknownIRVersionError`
+(fail-closed, no consumer-capability guessing). The two chains are independent
+and separately validated; IR V2 never mutates an IR V1 return object.
+
+### IR V2 facts + relations (6F + 8R)
+
+| Class | Types |
+| ----- | ----- |
+| Facts (6) | `shared_access`, `thread_entry_point`, `thread_spawn`, `thread_join`, `resource_lifetime`, `may_parallel`, `held_locks` |
+| Relations (8) | `spawn_join`, `protect`, `same_lock`, `different_lock`, `unlock_omitted_on_path`, `may_call`, `deref_resolves_to`, `same_storage` |
+
+Semantic limits (M4): `may_parallel` confidence ∈ {`ambiguous`, `unresolved`} and
+`held_locks` ∈ {`ambiguous`} (never definite); `spawn_join` is a pairing relation,
+not a HAPPENS_BEFORE; `held_locks`/`protect` never synth a GUARDED_BY;
+`coverage.not_produced == ["happens_before", "guarded_by"]`. `candidate_id` is
+nullable: file-level facts/relations carry `null` (they exist before candidate
+identification), candidate-bound `shared_access` facts reference a real id.
+
+### DEREF default OFF (decision 1)
+
+`resolve_evidence(..., ir_version="2", enable_deref=False)` (default) derives no
+`deref_resolves_to` / `same_storage` relations; `enable_deref=True` enables them.
+`deref_resolves_to` confidence is three-state `must` / `may` / `unknown` with no
+cross-upgrade (a `may` is never upgraded to `must`, and a failed resolution is
+never degraded to a guessed relation). The manifest discloses
+`ir_v2.deref.default == "disabled"`.
+
+### Module split (R2)
+
+`ir_v2.py` is the pure transformer+validator (imports only `ir.py` and stdlib).
+`ir_v2_source.py` is the **only** module that imports the engine: it reuses the
+graph's own `query_concurrency_context` / `query_access_lockset` /
+`query_call_relation` / `build_deref_resolution` entry points (never
+re-implementing lock/thread/call analysis), assembles a consistent single-snapshot
+input record, and distinguishes a *query failure* (analyzer status != `available`)
+from *fact absence* (available + empty lists). `skill_api.py` imports `ir_v2` at
+module level and `ir_v2_source` lazily inside the V2 path, so the V1 path and the
+manifest never load the engine.
+
+```python
+from provenlattice.evidence_projection import ir_v2
+
+evidence = ir_v2.assemble_ir_v2(input_record, run_context={"code_revision": "..."})
+problems = ir_v2.validate_evidence_ir_v2(evidence)   # [] == valid
+```
+
+Test coverage: `tests/test_ir_v2.py` (transformer/validator), `tests/test_ir_v2_source.py`
+(input assembler), and the IR V2 dispatch cases in `tests/test_skill_api.py`.
+
 ## Testing
 
 ```bash

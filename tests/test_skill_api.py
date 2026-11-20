@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from provenlattice.evidence_projection import adapter, constants as C, ir, registry
+from provenlattice.evidence_projection import ir_v2_source
 from provenlattice.evidence_projection import skill_api
 
 FIXTURES = Path(__file__).resolve().parent.parent / "src" / "provenlattice" \
@@ -46,6 +47,30 @@ def _race_src():
 
 def _double_free_src():
     return source_ok({"candidates": [load("double_free_candidate.json")]})
+
+
+def _empty_ir_v2_input():
+    """A valid, engine-free input record for the IR V2 path (all analyzers
+    available but empty)."""
+    return {
+        "defect_type": "race_condition",
+        "file_path": "src/t.c",
+        "status": "available",
+        "reason": None,
+        "missing": {},
+        "concurrency_context": {
+            "thread_entry_points": [], "spawns": [], "joins": [],
+            "spawn_join_pairs": [], "resource_lifetime": [],
+            "may_parallel": [], "missing_evidence": [], "capability_gaps": [],
+        },
+        "access_lockset": {"access_locksets": [], "relations": [], "coverage": {}},
+        "call_relation": {"call_relations": [], "provenance": {}},
+        "deref_resolution": {"deref_resolves_to": [], "same_storage": [],
+                             "coverage": {}},
+        "baseline_bundle": None,
+        "enable_deref": False,
+        "error": None,
+    }
 
 
 class ManifestTruthfulnessTests(unittest.TestCase):
@@ -85,12 +110,13 @@ class ManifestTruthfulnessTests(unittest.TestCase):
             self.assertTrue(fact.get("source"))
             self.assertTrue(fact.get("limitations"))
 
-    def test_race_not_produced_facts_is_happens_before_only(self):
+    def test_race_not_produced_facts_happens_before_and_guarded_by(self):
         manifest = skill_api.list_skill_capabilities()
         race = manifest["defect_types"]["race_condition"]
-        self.assertEqual(sorted(race["not_produced_facts"]), ["happens_before"])
-        self.assertEqual(race["not_produced_facts"]["happens_before"]["status"],
-                         "not_produced")
+        self.assertEqual(sorted(race["not_produced_facts"]),
+                         ["guarded_by", "happens_before"])
+        for fact in race["not_produced_facts"].values():
+            self.assertEqual(fact["status"], "not_produced")
 
     def test_double_free_projects_release_sites_and_no_concurrency_facts(self):
         manifest = skill_api.list_skill_capabilities()
@@ -189,6 +215,97 @@ class FailClosedTests(unittest.TestCase):
             with self.assertRaises(skill_api.EvidenceIRValidationError):
                 skill_api.resolve_evidence("repo", "graph.db",
                                            defect_type="race_condition")
+
+
+class IRV2DispatchTests(unittest.TestCase):
+    """M7: ir_version negotiation is explicit and fail-closed; the IR V2 path is
+    independent of the frozen IR V1 chain and never calls its projector."""
+
+    @staticmethod
+    def _patch_v2_source(input_record=None, capture=None):
+        def fake_assemble(*a, **k):
+            if capture is not None:
+                capture.update(k)
+            record = _empty_ir_v2_input() if input_record is None else input_record
+            return copy.deepcopy(record)
+        return mock.patch.object(ir_v2_source, "assemble_ir_v2_input",
+                                 side_effect=fake_assemble)
+
+    def test_default_resolves_to_ir_v1(self):
+        src = _race_src()
+        with mock.patch.object(adapter, "query_defect",
+                               side_effect=lambda *a, **k: copy.deepcopy(src)):
+            evidence = skill_api.resolve_evidence("repo", "graph.db",
+                                                  defect_type="race_condition")
+        self.assertEqual(evidence["ir_schema_version"], ir.IR_SCHEMA_VERSION)
+
+    def test_explicit_ir_v2_reaches_ir_v2(self):
+        with self._patch_v2_source():
+            evidence = skill_api.resolve_evidence(
+                "repo", "graph.db", defect_type="race_condition",
+                ir_version="2", file_path="src/t.c")
+        self.assertEqual(evidence["ir_schema_version"], "2")
+        self.assertEqual(evidence["run"]["projector_version"], "2")
+
+    def test_unknown_ir_version_fails_closed(self):
+        with self.assertRaises(skill_api.UnknownIRVersionError):
+            skill_api.resolve_evidence("repo", "graph.db",
+                                       defect_type="race_condition",
+                                       ir_version="3")
+
+    def test_v2_path_never_calls_the_v1_projector(self):
+        with self._patch_v2_source(), \
+             mock.patch.object(adapter, "query_defect",
+                               side_effect=AssertionError("V1 adapter called")):
+            evidence = skill_api.resolve_evidence(
+                "repo", "graph.db", defect_type="race_condition",
+                ir_version="2", file_path="src/t.c")
+        self.assertEqual(evidence["ir_schema_version"], "2")
+
+    def test_v2_gates_unknown_defect_type(self):
+        with self._patch_v2_source():
+            with self.assertRaises(registry.UnknownDefectTypeError):
+                skill_api.resolve_evidence("repo", "graph.db",
+                                           defect_type="nonexistent",
+                                           ir_version="2", file_path="src/t.c")
+
+    def test_deref_defaults_off_in_v2_query_params(self):
+        with self._patch_v2_source():
+            evidence = skill_api.resolve_evidence(
+                "repo", "graph.db", defect_type="race_condition",
+                ir_version="2", file_path="src/t.c")
+        self.assertIs(evidence["run"]["query_params"]["enable_deref"], False)
+
+    def test_enable_deref_flows_through_to_input_assembler(self):
+        captured = {}
+        with self._patch_v2_source(capture=captured):
+            skill_api.resolve_evidence(
+                "repo", "graph.db", defect_type="race_condition",
+                ir_version="2", file_path="src/t.c", enable_deref=True)
+        self.assertIs(captured["enable_deref"], True)
+
+    def test_deref_default_off_disclosed_in_manifest(self):
+        manifest = skill_api.list_skill_capabilities()
+        self.assertEqual(manifest["ir_v2"]["deref"]["default"], "disabled")
+        self.assertEqual(manifest["ir_v2"]["deref"]["confidence_states"],
+                         ["must", "may", "unknown"])
+
+    def test_manifest_declares_supported_ir_versions(self):
+        manifest = skill_api.list_skill_capabilities()
+        self.assertEqual(manifest["ir_versions_supported"], ["1", "2"])
+
+    def test_manifest_ir_v2_catalog_matches_types(self):
+        manifest = skill_api.list_skill_capabilities()
+        cat = manifest["ir_v2"]
+        self.assertEqual(sorted(cat["fact_types"]),
+                         sorted(["shared_access", "thread_entry_point",
+                                 "thread_spawn", "thread_join", "resource_lifetime",
+                                 "may_parallel", "held_locks"]))
+        self.assertEqual(sorted(cat["relation_types"]),
+                         sorted(["spawn_join", "protect", "same_lock",
+                                 "different_lock", "unlock_omitted_on_path",
+                                 "may_call", "deref_resolves_to", "same_storage"]))
+        self.assertEqual(cat["not_produced"], ["happens_before", "guarded_by"])
 
 
 class ForwardingTests(unittest.TestCase):
