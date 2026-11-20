@@ -1,0 +1,201 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://provenlattice/evidence_projection/schema/evidence_ir_v2.schema.json",
+  "title": "Canonical Evidence IR V2",
+  "description": "Versioned, additive, machine-verifiable unified evidence structure that projects the five file-level concurrency fact classes (already produced by the graph but never before projected) into typed facts/relations. Ten standard blocks plus a lossless source_envelope (deep copy of the IR V2 input record). ir_schema_version is the IR's own structure version; run.projector_version is \"2\" (distinct from run.projection_version, the Registry projector_version \"1\", and IR V1's NOT_APPLICABLE). File-level facts/relations carry candidate_id=null (they exist before candidate identification); candidate-bound shared_access facts reference a real candidate id.",
+  "type": "object",
+  "required": [
+    "ir_schema_version",
+    "bundle_status",
+    "run",
+    "candidates",
+    "claims",
+    "facts",
+    "relations",
+    "locations",
+    "provenance",
+    "coverage",
+    "limitations",
+    "source_envelope"
+  ],
+  "properties": {
+    "ir_schema_version": { "const": "2" },
+    "bundle_status": {
+      "type": "string",
+      "enum": ["ok", "partial", "empty", "unsupported_only", "stale", "not_built", "failed", "timeout"]
+    },
+    "run": { "$ref": "#/definitions/run" },
+    "candidates": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/candidate" }
+    },
+    "claims": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/claim" }
+    },
+    "facts": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/fact" }
+    },
+    "relations": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/relation" }
+    },
+    "locations": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/location" }
+    },
+    "provenance": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/provenanceRecord" }
+    },
+    "coverage": { "$ref": "#/definitions/coverage" },
+    "limitations": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "source_envelope": {
+      "type": "object",
+      "description": "Deep copy of the IR V2 input record (lossless fallback, C1)."
+    }
+  },
+  "definitions": {
+    "run": {
+      "type": "object",
+      "required": [
+        "code_revision", "engine_version", "db_snapshot_identity",
+        "source_schema_version", "contract_version", "projection_version",
+        "adapter_version", "core_adapter_version", "projector_version",
+        "query_params", "error", "reason"
+      ],
+      "properties": {
+        "code_revision": { "type": "string", "minLength": 1 },
+        "engine_version": { "type": "string", "minLength": 1 },
+        "db_snapshot_identity": { "type": "string", "minLength": 1 },
+        "source_schema_version": { "type": "string", "minLength": 1 },
+        "contract_version": { "type": "string", "minLength": 1 },
+        "projection_version": { "type": "string", "minLength": 1 },
+        "adapter_version": { "type": "string", "minLength": 1 },
+        "core_adapter_version": { "type": "string" },
+        "projector_version": { "const": "2" },
+        "query_params": {
+          "type": "object",
+          "properties": {
+            "ir_version": { "const": "2" },
+            "defect_type": { "type": "string" },
+            "file_path": { "type": "string" },
+            "enable_deref": { "type": "boolean" }
+          },
+          "required": ["ir_version", "defect_type", "enable_deref"]
+        },
+        "error": { "type": ["string", "null"] },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "required": ["id", "defect_type", "identity", "subject", "primary_anchor"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "defect_type": { "type": "string" },
+        "evidence_id": { "type": "string" },
+        "defect_key": { "type": "string" },
+        "discriminator": { "type": "string" },
+        "identity": { "type": "string" },
+        "subject": { "type": "string" },
+        "primary_anchor": { "$ref": "#/definitions/anchor" }
+      }
+    },
+    "claim": {
+      "type": "object",
+      "required": ["claim", "status"],
+      "properties": {
+        "claim": { "type": "string", "minLength": 1 },
+        "status": { "type": "string", "enum": ["SUPPORTED", "UNSUPPORTED", "UNKNOWN", "PARTIAL"] }
+      }
+    },
+    "fact": {
+      "type": "object",
+      "required": ["fact_id", "fact_type", "candidate_id", "file", "line", "line_span", "provenance", "confidence", "payload"],
+      "properties": {
+        "fact_id": { "type": "string", "description": "Real engine fact/event id; empty string marks an explicit degradation." },
+        "fact_type": {
+          "type": "string",
+          "enum": ["shared_access", "thread_entry_point", "thread_spawn", "thread_join", "resource_lifetime", "may_parallel", "held_locks"]
+        },
+        "candidate_id": { "type": ["string", "null"], "description": "null for file-level facts (exist before candidate identification); a non-null value references a candidate id." },
+        "file": { "type": "string" },
+        "line": { "type": "integer", "description": "0 when the engine fact carries only byte offsets, never a fabricated line." },
+        "line_span": { "type": "array", "items": { "type": "integer" } },
+        "provenance": { "type": "string" },
+        "confidence": { "type": "string" },
+        "payload": { "type": "object" }
+      }
+    },
+    "relation": {
+      "type": "object",
+      "required": ["relation_id", "relation_type", "candidate_id", "confidence", "endpoints", "payload"],
+      "properties": {
+        "relation_id": { "type": "string" },
+        "relation_type": {
+          "type": "string",
+          "enum": ["spawn_join", "protect", "same_lock", "different_lock", "unlock_omitted_on_path", "may_call", "deref_resolves_to", "same_storage"]
+        },
+        "candidate_id": { "type": ["string", "null"] },
+        "confidence": { "type": "string" },
+        "endpoints": { "type": "array", "items": { "type": "string" } },
+        "payload": { "type": "object" }
+      }
+    },
+    "location": {
+      "type": "object",
+      "required": ["candidate_id", "file", "line", "semantic_role", "anchor_class"],
+      "properties": {
+        "candidate_id": { "type": "string", "minLength": 1 },
+        "file": { "type": "string" },
+        "line": { "type": "integer" },
+        "line_span": { "type": "array", "items": { "type": "integer" } },
+        "owner": { "type": "string" },
+        "role": { "type": "string" },
+        "semantic_role": { "type": "string" },
+        "anchor_class": { "type": "string" },
+        "source_fact_id": { "type": "string" },
+        "event_id": { "type": "string" },
+        "provenance": { "type": "string" }
+      }
+    },
+    "provenanceRecord": {
+      "type": "object",
+      "required": ["target_kind", "fact_id", "candidate_id", "origin", "projection_version", "adapter_version", "contract_version"],
+      "properties": {
+        "target_kind": { "type": "string", "enum": ["fact", "relation"] },
+        "fact_id": { "type": "string" },
+        "candidate_id": { "type": ["string", "null"] },
+        "origin": { "type": "string" },
+        "projection_version": { "type": "string" },
+        "adapter_version": { "type": "string" },
+        "contract_version": { "type": "string" }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "required": ["fact_types", "relation_types", "confidence", "not_produced"],
+      "properties": {
+        "source_location": { "type": "object" },
+        "fact_types": { "type": "object" },
+        "relation_types": { "type": "object" },
+        "confidence": { "type": "object" },
+        "not_produced": { "const": ["happens_before", "guarded_by"] }
+      }
+    },
+    "anchor": {
+      "type": ["object", "null"],
+      "properties": {
+        "file": { "type": "string" },
+        "line": { "type": "integer" },
+        "line_span": { "type": "array", "items": { "type": "integer" } },
+        "provenance": { "type": "string" }
+      }
+    }
+  }
+}
