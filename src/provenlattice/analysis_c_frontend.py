@@ -368,3 +368,392 @@ class CFrontend:
             parse_coverage=round(coverage, 6),
             partial=bool(error_nodes or missing_nodes),
         )
+
+
+# ---------------------------------------------------------------------------
+# ATOMIC facts (issue-pilot#89, G1)
+#
+# The event lexicon already names atomic *operations* (atomic_load, fetch_add,
+# ...). It cannot see the two shapes where atomicity is carried by the object
+# or by a region:
+#
+#   _Atomic int c;                         the object itself is atomic
+#   __VERIFIER_atomic_begin(); ... end();  a paired region is atomic
+#
+# This module owns the syntax side of both. It produces plain data; the
+# sparse-CFG materializer turns it into additive ATOMIC points. Nothing here
+# decides a defect, and a use is bound through the declaration index whenever
+# the index can answer -- the recovered `_Atomic(type)` form is the bounded
+# exception, because the installed grammars do not parse that C11 spelling.
+# ---------------------------------------------------------------------------
+
+ATOMIC_QUALIFIER = "_Atomic"
+VERIFIER_ATOMIC_BEGIN = "__VERIFIER_atomic_begin"
+VERIFIER_ATOMIC_END = "__VERIFIER_atomic_end"
+
+_ATOMIC_QUALIFIER_WORD = re.compile(r"\b_Atomic\b")
+# `_declarator_name` is stateless; the frontend instance is only the holder.
+_DECLARATOR_NAME = CFrontend()._declarator_name
+
+
+@dataclass(frozen=True, slots=True)
+class AtomicDeclaration:
+    """One declaration whose object is atomic in V1's sense."""
+
+    start_byte: int
+    end_byte: int
+    name: str
+    name_start: int
+    name_end: int
+    owner_start: int | None
+    owner_end: int | None
+    source: str  # "type_qualifier" | "type_specifier"
+
+
+@dataclass(frozen=True, slots=True)
+class AtomicFacts:
+    """What the atomic syntax facts say about one file.
+
+    `declaration_keys` mirrors the `Declaration` identity the index stores
+    (`start_byte`, `name`). `recovered` covers the `_Atomic(type)` spelling the
+    installed grammars parse as an ERROR; those declarations are not in the
+    index, so the only matching rule is the recorded owner span plus the
+    declaration's own position. `limitations` is data, never a silent drop.
+    """
+
+    declaration_keys: frozenset[tuple[int, str]] = frozenset()
+    pointee_keys: frozenset[tuple[int, str]] = frozenset()
+    aliases: frozenset[str] = frozenset()
+    recovered: tuple[AtomicDeclaration, ...] = ()
+    regions: tuple[tuple[int, int], ...] = ()
+    limitations: tuple[str, ...] = ()
+
+    def is_atomic_declaration(self, declaration: Any) -> bool:
+        return (
+            declaration is not None
+            and (declaration.start_byte, declaration.name) in self.declaration_keys
+        )
+
+    def is_atomic_pointee(self, declaration: Any) -> bool:
+        """Whether the declaration is a one-level pointer to an atomic object.
+
+        `_Atomic int *p` declares a pointer *to* an atomic object: `*p` and
+        `p[i]` are atomic, the pointer variable itself is not. Deeper pointer
+        levels stay unsupported (the dereference count would have to match).
+        """
+        return (
+            declaration is not None
+            and (declaration.start_byte, declaration.name) in self.pointee_keys
+        )
+
+    def inside_region(self, byte: int) -> bool:
+        return any(start <= byte < end for start, end in self.regions)
+
+    def recovered_declaration(
+        self, name: str, owner_start: int | None, owner_end: int | None, byte: int,
+    ) -> AtomicDeclaration | None:
+        """The visible recovered `_Atomic(type)` declaration for a use, if any.
+
+        Visibility is bounded to the declaration's own owner span and the
+        declaration's start byte; a same-spelled name declared later is not
+        evidence for an earlier use.
+        """
+        matches = [
+            declaration for declaration in self.recovered
+            if declaration.name == name
+            and (
+                declaration.owner_start is None
+                or (
+                    declaration.owner_start == owner_start
+                    and declaration.owner_end == owner_end
+                )
+            )
+            and declaration.start_byte <= byte
+        ]
+        return max(matches, key=lambda declaration: declaration.start_byte) if matches else None
+
+
+def _walk_nodes(root: Any) -> Any:
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(reversed(node.named_children))
+
+
+def _node_text(source: bytes, node: Any) -> str:
+    return source[node.start_byte:node.end_byte].decode("utf-8", "replace")
+
+
+def _inner_declarator(node: Any) -> Any:
+    inner = node.child_by_field_name("declarator")
+    if inner is not None:
+        return inner
+    return node.named_children[-1] if node.named_children else None
+
+
+def _declarator_rejects_atomic(declarator: Any) -> bool:
+    """Whether the declarator binds a pointer/reference/function, not the object.
+
+    `_Atomic int *p` declares a pointer *to* an atomic object: touching `p`
+    itself is not an atomic access. `_Atomic int a[4]` remains an array of
+    atomic elements. `_Atomic(int*) p` never reaches this function because the
+    grammar rejects it; the recovered form is already the whole atomic type.
+    """
+    node = declarator
+    if node is not None and node.type == "init_declarator":
+        node = node.child_by_field_name("declarator") or node
+    while node is not None and node.type == "parenthesized_declarator":
+        node = _inner_declarator(node)
+    if node is None:
+        return False
+    if node.type in {"pointer_declarator", "reference_declarator", "function_declarator"}:
+        return True
+    if node.type == "array_declarator":
+        inner = _inner_declarator(node)
+        while inner is not None and inner.type == "parenthesized_declarator":
+            inner = _inner_declarator(inner)
+        return inner is not None and inner.type in {
+            "pointer_declarator", "reference_declarator", "function_declarator",
+        }
+    return False
+
+
+def _type_definition_name(node: Any, source: bytes) -> str:
+    candidate = node.child_by_field_name("declarator") or node.child_by_field_name("name")
+    name = _DECLARATOR_NAME(candidate, source)
+    if name:
+        return name
+    for child in reversed(node.named_children):
+        if child.type == "type_identifier":
+            return _node_text(source, child)
+    return ""
+
+
+def _collect_atomic_aliases(root: Any, source: bytes) -> frozenset[str]:
+    """Typedef names whose type is `_Atomic` (including alias-of-alias)."""
+    definitions = [
+        (node, _type_definition_name(node, source), _node_text(source, node))
+        for node in _walk_nodes(root) if node.type == "type_definition"
+    ]
+    definitions = [entry for entry in definitions if entry[1]]
+    aliases: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for _node, name, text in definitions:
+            if name in aliases:
+                continue
+            if _ATOMIC_QUALIFIER_WORD.search(text) or any(
+                re.search(rf"\b{re.escape(alias)}\b", text) for alias in aliases
+            ):
+                aliases.add(name)
+                changed = True
+    return frozenset(aliases)
+
+
+def _has_atomic_qualifier(node: Any, source: bytes, aliases: frozenset[str]) -> bool:
+    type_node = node.child_by_field_name("type")
+    if type_node is not None and _ATOMIC_QUALIFIER_WORD.search(_node_text(source, type_node)):
+        return True
+    for child in node.named_children:
+        if child.type == "type_qualifier" and _node_text(source, child).strip() == ATOMIC_QUALIFIER:
+            return True
+        if child.type == "type_identifier" and _node_text(source, child).strip() in aliases:
+            return True
+    return False
+
+
+def _pointer_level(declarator: Any) -> int | None:
+    """The pointer depth of a stable pointer-to-identifier declarator.
+
+    Returns None for anything V1 should not turn into a pointee fact: a
+    function/reference declarator, a pointer to an array/function, or an
+    ambiguous chain. A one-level pointer to a plain name is the supported
+    `_Atomic int *p` shape.
+    """
+    node = declarator
+    if node is not None and node.type == "init_declarator":
+        node = node.child_by_field_name("declarator") or node
+    while node is not None and node.type == "parenthesized_declarator":
+        node = _inner_declarator(node)
+    if node is None or node.type != "pointer_declarator":
+        return None
+    level = 0
+    while node is not None and node.type == "pointer_declarator":
+        level += 1
+        node = _inner_declarator(node)
+        while node is not None and node.type == "parenthesized_declarator":
+            node = _inner_declarator(node)
+    if node is None or node.type != "identifier":
+        return None
+    return level
+
+
+def _collect_atomic_declarations(
+    root: Any, source: bytes, aliases: frozenset[str],
+) -> tuple[frozenset[tuple[int, str]], frozenset[tuple[int, str]], tuple[str, ...]]:
+    keys: set[tuple[int, str]] = set()
+    pointee_keys: set[tuple[int, str]] = set()
+    limitations: list[str] = []
+    for node in _walk_nodes(root):
+        if node.type not in {"declaration", "parameter_declaration", "field_declaration"}:
+            continue
+        if not _has_atomic_qualifier(node, source, aliases):
+            continue
+        for declarator in node.children_by_field_name("declarator"):
+            name = _DECLARATOR_NAME(declarator, source)
+            if not name:
+                continue
+            level = _pointer_level(declarator)
+            if level is not None:
+                if level == 1:
+                    pointee_keys.add((node.start_byte, name))
+                else:
+                    limitations.append(f"atomic_pointer_depth:{name}@{node.start_byte}")
+                continue
+            if _declarator_rejects_atomic(declarator):
+                limitations.append(f"atomic_pointer_or_function:{name}@{node.start_byte}")
+                continue
+            keys.add((node.start_byte, name))
+    return frozenset(keys), frozenset(pointee_keys), tuple(limitations)
+
+
+def _owner_span(owners: Any, start_byte: int, end_byte: int) -> tuple[int | None, int | None]:
+    if owners is None:
+        return None, None
+    span = owners.owner_of(start_byte, end_byte)
+    if span is None:
+        return None, None
+    return span.start_byte, span.end_byte
+
+
+def _collect_recovered_atomic(
+    root: Any, source: bytes, owners: Any,
+) -> tuple[tuple[AtomicDeclaration, ...], tuple[str, ...]]:
+    """Recover the C11 `_Atomic(type) name;` spelling from the ERROR node.
+
+    Neither installed grammar has an atomic type-specifier rule, so the source
+    arrives as `ERROR[_Atomic, parenthesized type, name]` followed by `;`. The
+    recovered name is a top-level identifier child of that ERROR (the type's
+    own identifiers live inside the parenthesized declarator). This is the one
+    place a use is matched without a DeclarationIndex record; the match stays
+    bounded to the same owner span and position, never to a bare spelling
+    across methods.
+    """
+    recovered: list[AtomicDeclaration] = []
+    limitations: list[str] = []
+    for node in _walk_nodes(root):
+        if node.type != "ERROR":
+            continue
+        text = _node_text(source, node).lstrip()
+        if not text.startswith(ATOMIC_QUALIFIER) or "(" not in text:
+            continue
+        names = [child for child in node.named_children if child.type == "identifier"]
+        if not names:
+            limitations.append(f"atomic_type_specifier_unresolved@{node.start_byte}")
+            continue
+        owner_start, owner_end = _owner_span(owners, node.start_byte, node.end_byte)
+        for name_node in names:
+            recovered.append(AtomicDeclaration(
+                start_byte=node.start_byte,
+                end_byte=node.end_byte,
+                name=_node_text(source, name_node),
+                name_start=name_node.start_byte,
+                name_end=name_node.end_byte,
+                owner_start=owner_start,
+                owner_end=owner_end,
+                source="type_specifier",
+            ))
+    return tuple(recovered), tuple(limitations)
+
+
+def _enclosing_compound(node: Any) -> Any:
+    while node is not None:
+        if node.type == "compound_statement":
+            return node
+        node = node.parent
+    return None
+
+
+def _collect_atomic_regions(
+    root: Any, source: bytes, owners: Any,
+) -> tuple[tuple[tuple[int, int], ...], tuple[str, ...]]:
+    """Pair `__VERIFIER_atomic_begin/end` calls inside one owner.
+
+    A pair is strong only when it is sequential and both calls sit in the same
+    compound statement. A nested begin invalidates the open pair and itself;
+    an end in a different block is interleaved; an unmatched call is unpaired.
+    Every rejected shape is a named limitation -- none becomes ATOMIC.
+    """
+    calls: list[tuple[int, int, str, int, tuple[int | None, int | None]]] = []
+    for node in _walk_nodes(root):
+        if node.type != "call_expression":
+            continue
+        function = node.child_by_field_name("function")
+        if function is None or function.type != "identifier":
+            continue
+        name = _node_text(source, function).strip()
+        if name not in {VERIFIER_ATOMIC_BEGIN, VERIFIER_ATOMIC_END}:
+            continue
+        compound = _enclosing_compound(node)
+        owner = _owner_span(owners, node.start_byte, node.end_byte)
+        calls.append((
+            node.start_byte, node.end_byte, name,
+            compound.start_byte if compound is not None else -1,
+            owner,
+        ))
+    calls.sort(key=lambda call: (call[0], call[1]))
+
+    groups: dict[tuple[int | None, int | None], list[tuple[int, int, str, int]]] = {}
+    for start, end, name, compound, owner in calls:
+        groups.setdefault(owner, []).append((start, end, name, compound))
+
+    regions: list[tuple[int, int]] = []
+    limitations: list[str] = []
+    for owner, ordered in groups.items():
+        stack: list[tuple[int, int, int, bool]] = []  # (start, end, compound, valid)
+        for start, end, name, compound in ordered:
+            if name == VERIFIER_ATOMIC_BEGIN:
+                if stack:
+                    # A nested begin makes every open pair and the new one
+                    # non-strong: the region's extent is no longer sequential.
+                    stack = [(a, b, c, False) for a, b, c, _valid in stack]
+                    limitations.append(f"atomic_block_nested@{start}")
+                    stack.append((start, end, compound, False))
+                    continue
+                stack.append((start, end, compound, True))
+                continue
+            if not stack:
+                limitations.append(f"atomic_block_unpaired_end@{start}")
+                continue
+            begin_start, begin_end, begin_compound, valid = stack.pop()
+            if not valid or begin_compound != compound:
+                limitations.append(f"atomic_block_interleaved@{begin_start}")
+                continue
+            if begin_end > start:
+                limitations.append(f"atomic_block_inverted@{begin_start}")
+                continue
+            regions.append((begin_end, start))
+        for begin_start, _begin_end, _compound, _valid in stack:
+            limitations.append(f"atomic_block_unpaired_begin@{begin_start}")
+    return tuple(sorted(regions)), tuple(limitations)
+
+
+def collect_atomic_facts(root: Any, source: bytes, owners: Any = None) -> AtomicFacts:
+    """Collect the file's atomic declaration/region facts (issue-pilot#89)."""
+    aliases = _collect_atomic_aliases(root, source)
+    declaration_keys, pointee_keys, declaration_limitations = _collect_atomic_declarations(
+        root, source, aliases)
+    recovered, recovered_limitations = _collect_recovered_atomic(root, source, owners)
+    regions, region_limitations = _collect_atomic_regions(root, source, owners)
+    return AtomicFacts(
+        declaration_keys=declaration_keys,
+        pointee_keys=pointee_keys,
+        aliases=aliases,
+        recovered=recovered,
+        regions=regions,
+        limitations=tuple(sorted(
+            (*declaration_limitations, *recovered_limitations, *region_limitations)
+        )),
+    )

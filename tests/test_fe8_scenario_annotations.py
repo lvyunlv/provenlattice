@@ -466,10 +466,10 @@ class ScenarioWalkerByteSpanTests(unittest.TestCase):
         self.assertEqual(ANALYZER_VERSIONS["ast:c"], 4)
         # sparse_cfg:cpp advanced 1->2 for FE8-F1 (byte spans), 2->3 for
         # FE-5 (THREAD_JOIN handle annotations), 3->4 for SUB-09 F1
-        # (indirect field-callee READ), and 5->6 for #82 buffer/extent/access
-        # facts. Each advance invalidates the sparse_cfg cache so the new facts
-        # are rematerialized.
-        self.assertEqual(ANALYZER_VERSIONS["sparse_cfg:cpp"], 6)
+        # (indirect field-callee READ), 5->6 for #82 buffer/extent/access
+        # facts, and 6->7 for #89 atomic access points. Each advance
+        # invalidates the sparse_cfg cache so the new facts are rematerialized.
+        self.assertEqual(ANALYZER_VERSIONS["sparse_cfg:cpp"], 7)
 
     def test_sparse_cfg_version_bump_restalifies_cache(self) -> None:
         # Owner Decision V1 (sparse_cfg:cpp 1->2): the version genuinely
