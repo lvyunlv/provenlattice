@@ -9,6 +9,7 @@ from provenlattice.analysis_query import query_analysis
 from provenlattice.concurrency_lock_scenarios import (
     _flow_successor, _threaded_dataflow, build_access_lockset,
 )
+from provenlattice.defect_query import query_defect_candidates
 from provenlattice.graph import full_index
 from provenlattice.orchestrator import analyze_scope
 
@@ -24,6 +25,7 @@ class CrossFunctionCallScopeBase(unittest.TestCase):
     FIXTURE = ""
     TARGET = "src/a.c"
     ANALYZE_SCOPE = "src"
+    FEATURES = ("events", "sparse_cfg")
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -34,7 +36,7 @@ class CrossFunctionCallScopeBase(unittest.TestCase):
         self.database = Path(self.temp.name) / "graph.db"
         full_index(self.root, self.database)
         analyze_scope(
-            self.root, self.ANALYZE_SCOPE, ("events", "sparse_cfg"),
+            self.root, self.ANALYZE_SCOPE, self.FEATURES,
             database=self.database,
         )
 
@@ -843,6 +845,66 @@ class MetamorphicTests(unittest.TestCase):
         self.assertEqual(first[0], second[0])
         self.assertTrue(first[1])
         self.assertEqual(len(first[1]), len(second[1]))
+
+
+class DefectQueryWiringTests(CrossFunctionCallScopeBase):
+    """The race query, not just the lockset producer, consumes the new inputs."""
+
+    FEATURES = ("events", "sparse_cfg", "sparse_dfg")
+    FIXTURES = {"src/a.c": (
+        "#include <pthread.h>\n"
+        "pthread_mutex_t m;\n"
+        "int shared;\n"
+        "void reach_error(void) {}\n"
+        "void check(int condition) { if (!condition) { reach_error(); } }\n"
+        "void first(void) {\n"
+        "    pthread_mutex_lock(&m);\n"
+        "    shared++;\n"
+        "    check(1);\n"
+        "    shared++;\n"
+        "    pthread_mutex_unlock(&m);\n"
+        "}\n"
+        "void second(void) {\n"
+        "    pthread_mutex_lock(&m);\n"
+        "    shared++;\n"
+        "    pthread_mutex_unlock(&m);\n"
+        "}\n"
+        "void *t1(void *a) { first(); return 0; }\n"
+        "void *t2(void *a) { second(); return 0; }\n"
+        "void start(void) {\n"
+        "    pthread_t a, b;\n"
+        "    pthread_create(&a, 0, t1, 0);\n"
+        "    pthread_create(&b, 0, t2, 0);\n"
+        "    pthread_join(a, 0);\n"
+        "    pthread_join(b, 0);\n"
+        "}\n"
+    )}
+
+    def race_result(self) -> dict:
+        result = query_defect_candidates(
+            self.root, defect_type="race_condition", database=self.database)
+        self.assertEqual(result["status"], "available", result.get("reason"))
+        return result
+
+    def test_race_query_excludes_same_lock_across_lock_free_call(self) -> None:
+        result = self.race_result()
+        self.assertEqual(result["candidates"], [])
+        self.assertGreaterEqual(
+            result["coverage"].get("disqualified_same_lock", 0), 1)
+
+    def test_race_query_keeps_candidate_for_opaque_call(self) -> None:
+        source = self.FIXTURES["src/a.c"].replace(
+            "void reach_error(void) {}",
+            "void reach_error(void) {}\nvoid opaque(int);",
+        ).replace("check(1);", "opaque(1);")
+        write(self.root, "src/a.c", source)
+        full_index(self.root, self.database)
+        analyze_scope(
+            self.root, "src", self.FEATURES, database=self.database)
+        result = self.race_result()
+        self.assertTrue(result["candidates"])
+        self.assertEqual(
+            result["coverage"].get("disqualified_same_lock", 0), 0)
 
 
 if __name__ == "__main__":

@@ -314,8 +314,10 @@ def _resolved_call_target(row: Mapping[str, Any]) -> str:
     return str(row["resolved_symbol_id"])
 
 
-def _call_lock_inputs(
-    repo, database, env: Mapping[str, Any], lock_env: Mapping[str, Any],
+def call_lock_inputs(
+    repo, database=None, *,
+    files: Iterable[str] | None = None,
+    events_by_file: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[dict[tuple[str, str, int], str | None], frozenset[str]]:
     """Resolve CALL sites and compute a conservative lock-free callee set.
 
@@ -324,13 +326,17 @@ def _call_lock_inputs(
     keeps fully resolved lock-free cycles lock-free, while a direct lock,
     ambiguous join, indirect call, declaration-only target or unavailable body
     removes the owner and all of its callers from that set.
+
+    ``files`` limits which CALL sites are returned (the per-file lockset query
+    passes exactly one); ``None`` covers every CALLS row (the repo-wide defect
+    query). ``events_by_file`` supplies already-loaded events:cpp envelopes,
+    so the caller that has them does not query them twice.
     """
     root = Path(repo).resolve()
     database = (
         Path(database).resolve() if database
         else root / ".provenlattice" / "codegraph.db"
     )
-    current_file = str(env.get("file_id") or "")
     call_callees: dict[tuple[str, str, int], str | None] = {}
     with SQLiteStorage(database) as storage:
         references_by_key: dict[tuple[str, str, int], list[dict]] = {}
@@ -347,11 +353,12 @@ def _call_lock_inputs(
             )
             references_by_key.setdefault(key, []).append(row)
 
+        selected = frozenset(files) if files is not None else None
         pending: list[str] = []
         for key in sorted(references_by_key):
             rows = references_by_key[key]
             target = _resolved_call_target(rows[0]) if len(rows) == 1 else ""
-            if key[0] == current_file:
+            if selected is None or key[0] in selected:
                 call_callees[key] = target or None
                 if target:
                     pending.append(target)
@@ -377,11 +384,12 @@ def _call_lock_inputs(
                 node_cache[symbol_id] = row
             return node_cache[symbol_id]
 
+        provided = events_by_file or {}
+
         def event_file(file_id: str, path: str) -> Mapping[str, Any] | None:
             if file_id not in event_cache:
-                if file_id == current_file:
-                    candidate = lock_env
-                else:
+                candidate = provided.get(file_id)
+                if candidate is None:
                     candidate = query_analysis(
                         root, "events", file_path=path, database=database)
                 coverage = candidate.get("coverage") or {}
@@ -491,8 +499,12 @@ def query_access_lockset(
     lock_env = query_analysis(repo, "events", file_path=file_path, database=database)
     if lock_env["status"] != "available":
         return {"status": lock_env["status"], "reason": lock_env.get("reason")}
-    call_callees, lock_free_callees = _call_lock_inputs(
-        repo, database, env, lock_env)
+    current_file = str(env.get("file_id") or "")
+    call_callees, lock_free_callees = call_lock_inputs(
+        repo, database,
+        files={current_file} if current_file else None,
+        events_by_file={current_file: lock_env} if current_file else None,
+    )
     bundle = build_access_lockset(
         env.get("events", []),
         env.get("edges", []),
@@ -506,6 +518,7 @@ def query_access_lockset(
 
 __all__ = [
     "build_concurrency_context",
+    "call_lock_inputs",
     "query_concurrency_context",
     "query_access_lockset",
 ]
