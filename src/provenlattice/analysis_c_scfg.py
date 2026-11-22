@@ -136,7 +136,12 @@ def _declarator_contains(declarator, node) -> bool:
 
 
 def _in_declaration_context(node) -> bool:
-    """Whether `node` is a declarator or type spelling, not a use."""
+    """Whether `node` is a declarator or type spelling, not a use.
+
+    A declaration's *initializer value* is an ordinary expression: in
+    `int y = x;` the read of `x` is a real access. Only the type and the
+    declarator chain are context.
+    """
     ancestor = node.parent
     while ancestor is not None:
         if ancestor.type in {
@@ -149,7 +154,7 @@ def _in_declaration_context(node) -> bool:
             for declarator in ancestor.children_by_field_name("declarator"):
                 if _declarator_contains(declarator, node):
                     return True
-            return True
+            return False
         if ancestor.type == "function_definition":
             declarator = ancestor.child_by_field_name("declarator")
             return declarator is not None and _contains(declarator, node)
@@ -224,12 +229,21 @@ def _in_unevaluated_context(node) -> bool:
     """Whether `node` is an operand the language does not evaluate.
 
     `sizeof(g)` names `g` but reads nothing; publishing an access for it would
-    turn a compile-time query into a runtime race fact.
+    turn a compile-time query into a runtime race fact. `_Generic`'s
+    controlling expression is unevaluated, while its selected association is
+    an ordinary expression.
     """
     ancestor = node.parent
     while ancestor is not None:
         if ancestor.type in _UNEVALUATED_NODES:
             return True
+        if ancestor.type == "generic_expression" and ancestor.named_children:
+            control = ancestor.named_children[0]
+            if (
+                control.start_byte <= node.start_byte
+                and node.end_byte <= control.end_byte
+            ):
+                return True
         if ancestor.type in {"function_definition", "translation_unit"}:
             return False
         ancestor = ancestor.parent
@@ -238,11 +252,14 @@ def _in_unevaluated_context(node) -> bool:
 
 def _unevaluated_spans(root) -> tuple[tuple[int, int], ...]:
     """Byte spans of every unevaluated operand expression in the file."""
-    return tuple(
-        (node.start_byte, node.end_byte)
-        for node in _walk_tree(root)
-        if node.type in _UNEVALUATED_NODES
-    )
+    spans: list[tuple[int, int]] = []
+    for node in _walk_tree(root):
+        if node.type in _UNEVALUATED_NODES:
+            spans.append((node.start_byte, node.end_byte))
+        elif node.type == "generic_expression" and node.named_children:
+            control = node.named_children[0]
+            spans.append((control.start_byte, control.end_byte))
+    return tuple(spans)
 
 
 def _inside_spans(byte: int, spans: tuple[tuple[int, int], ...]) -> bool:
@@ -265,6 +282,13 @@ def _root_is_dereferenced(node, source: bytes) -> bool:
             current = parent
             continue
         argument = parent.child_by_field_name("argument")
+        if parent.type == "subscript_expression" and argument is not None:
+            if (
+                argument.start_byte == current.start_byte
+                and argument.end_byte == current.end_byte
+            ):
+                return True
+            return False
         if (
             parent.type == "pointer_expression"
             and argument is not None
@@ -276,24 +300,37 @@ def _root_is_dereferenced(node, source: bytes) -> bool:
         return False
 
 
+def _same_node(left, right) -> bool:
+    return (
+        left is not None
+        and left.start_byte == right.start_byte
+        and left.end_byte == right.end_byte
+    )
+
+
 def _access_expression(node, source: bytes):
-    """The whole access expression an identifier roots (`a[i]`, `*a`, `(a)`)."""
+    """The whole access expression an identifier roots (`a[i]`, `*a`, `(a)`).
+
+    Casts and parentheses are climbed as well: in `((int *)p)[0]` the
+    identifier `p` designates the subscripted access, not a bare pointer read.
+    """
     current = node
     while True:
         parent = current.parent
         if parent is None:
             break
-        if parent.type == "subscript_expression" and parent.child_by_field_name("argument") is current:
+        argument = parent.child_by_field_name("argument")
+        if parent.type == "subscript_expression" and _same_node(argument, current):
             current = parent
             continue
         if (
             parent.type == "pointer_expression"
-            and parent.child_by_field_name("argument") is current
+            and _same_node(argument, current)
             and source[parent.start_byte:parent.start_byte + 1] == b"*"
         ):
             current = parent
             continue
-        if parent.type == "parenthesized_expression":
+        if parent.type in {"parenthesized_expression", "cast_expression"}:
             current = parent
             continue
         break
@@ -350,10 +387,14 @@ def _atomic_source_for_annotations(atomic, declarations, owners, byte: int, anno
             owner.end_byte if owner is not None else None,
             byte,
         )
-        if recovered is not None and not _is_dereference_expression(
-            annotations.get("expression", "") or ""
-        ):
-            return "type_specifier"
+        if recovered is not None:
+            expression = annotations.get("expression", "") or ""
+            dereferenced = _is_dereference_expression(expression)
+            if recovered.kind == "pointee":
+                if dereferenced:
+                    return "type_specifier"
+            elif recovered.kind == "array" or not dereferenced:
+                return "type_specifier"
     return ""
 
 
@@ -500,13 +541,21 @@ def _collect_atomic_candidates(
             recovered = atomic.recovered_declaration(
                 subject, owner.start_byte, owner.end_byte, node.start_byte)
             expression_text = _node_text(source, expression_node)
+            dereferenced = (
+                _is_dereference_expression(expression_text)
+                or _root_is_dereferenced(node, source)
+            )
             if recovered is not None:
                 # `_Atomic(int *) p` makes the pointer object atomic, not the
-                # plain int it points at: only a non-dereference use of `p` is
-                # an atomic access.
-                if not _is_dereference_expression(expression_text):
+                # plain int it points at: only a dereference of `p` is atomic.
+                # An array of atomic elements is atomic for its element
+                # accesses; a plain object for non-dereference uses.
+                if recovered.kind == "pointee":
+                    if dereferenced:
+                        atomic_source = "type_specifier"
+                elif recovered.kind == "array" or not dereferenced:
                     atomic_source = "type_specifier"
-                elif inside_region:
+                if not atomic_source and inside_region:
                     atomic_source = "atomic_block"
             elif inside_region:
                 atomic_source = "atomic_block"

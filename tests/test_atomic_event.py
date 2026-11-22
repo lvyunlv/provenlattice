@@ -234,6 +234,95 @@ int size(void) {
 }
 """
 
+SHADOWED_TYPEDEF = r"""
+typedef _Atomic int T;
+void touch(void) {
+    typedef int T;
+    T x;
+    x = 1;
+}
+"""
+
+MACRO_ALIAS = r"""
+#define AI _Atomic int
+AI g;
+void touch(void) { g = 1; }
+"""
+
+MACRO_TYPE_SPECIFIER_ALIAS = r"""
+#define AI _Atomic(int)
+AI g;
+void touch(void) { g = 1; }
+"""
+
+TYPEDEF_TYPE_SPECIFIER_ALIAS = r"""
+typedef _Atomic(int) AI;
+AI g;
+void touch(void) { g = 1; }
+"""
+
+TYPEDEF_MULTI_DECLARATOR = r"""
+typedef _Atomic int T, U;
+U g;
+void touch(void) { g = 1; }
+"""
+
+RECOVERED_MULTI_DECLARATOR = r"""
+_Atomic(int) x = 0, y = 0;
+void touch(void) {
+    x = 1;
+    y = 2;
+}
+"""
+
+RECOVERED_POINTER = r"""
+_Atomic(int) *p;
+int *q;
+void touch(void) {
+    p = q;
+    *p = 1;
+}
+"""
+
+RECOVERED_ARRAY = r"""
+_Atomic(int) a[2];
+void touch(void) {
+    a[0] = 1;
+}
+"""
+
+INITIALIZER_READ = r"""
+void touch(void) {
+    _Atomic int x;
+    int y = x;
+    (void)y;
+}
+"""
+
+INITIALIZER_READ_IN_BLOCK = r"""
+int x;
+void touch(void) {
+    __VERIFIER_atomic_begin();
+    int y = x;
+    __VERIFIER_atomic_end();
+    (void)y;
+}
+"""
+
+GENERIC_CONTROL = r"""
+_Atomic int g_value;
+int pick(void) {
+    return _Generic(g_value, int: 0, default: 1);
+}
+"""
+
+CAST_SUBSCRIPT_ALIAS = r"""
+_Atomic int g_value;
+void touch(void *p) {
+    ((int *)p)[0] = 1;
+}
+"""
+
 RENAMED_REFORMATTED = r"""
 #include <pthread.h>
 
@@ -361,6 +450,66 @@ class AtomicEventTests(unittest.TestCase):
     def test_sizeof_operand_is_not_an_access(self) -> None:
         nodes, _env, _state = _materialize(SIZEOF_OPERAND)
         self.assertEqual(nodes, [])
+
+    def test_shadowed_typedef_is_not_atomic(self) -> None:
+        nodes, _env, _state = _materialize(SHADOWED_TYPEDEF)
+        self.assertEqual(nodes, [])
+
+    def test_macro_alias_of_atomic_type(self) -> None:
+        nodes, _env, _state = _materialize(MACRO_ALIAS)
+        self.assertEqual(_subjects(nodes), {"g"})
+
+    def test_macro_alias_of_type_specifier(self) -> None:
+        nodes, _env, _state = _materialize(MACRO_TYPE_SPECIFIER_ALIAS)
+        self.assertEqual(_subjects(nodes), {"g"})
+
+    def test_typedef_of_type_specifier(self) -> None:
+        nodes, _env, _state = _materialize(TYPEDEF_TYPE_SPECIFIER_ALIAS)
+        self.assertEqual(_subjects(nodes), {"g"})
+
+    def test_multiple_declarators_in_a_typedef(self) -> None:
+        nodes, _env, _state = _materialize(TYPEDEF_MULTI_DECLARATOR)
+        self.assertEqual(_subjects(nodes), {"g"})
+
+    def test_recovered_multiple_declarators(self) -> None:
+        nodes, _env, _state = _materialize(RECOVERED_MULTI_DECLARATOR)
+        self.assertEqual(_subjects(nodes), {"x", "y"})
+
+    def test_recovered_pointer_to_atomic_object(self) -> None:
+        nodes, _env, _state = _materialize(RECOVERED_POINTER)
+        self.assertTrue(nodes)
+        self.assertEqual(
+            {_annotations(node).get("expression", "") for node in nodes},
+            {"*p"},
+        )
+
+    def test_recovered_array_of_atomic_elements(self) -> None:
+        nodes, _env, _state = _materialize(RECOVERED_ARRAY)
+        self.assertTrue(nodes)
+        self.assertEqual(_subjects(nodes), {"a"})
+
+    def test_initializer_read_is_a_real_access(self) -> None:
+        nodes, _env, _state = _materialize(INITIALIZER_READ)
+        self.assertEqual(_subjects(nodes), {"x"})
+
+    def test_initializer_read_in_atomic_block(self) -> None:
+        nodes, _env, _state = _materialize(INITIALIZER_READ_IN_BLOCK)
+        self.assertTrue(nodes)
+        self.assertEqual(
+            {_annotations(node).get("atomic_source") for node in nodes},
+            {"atomic_block"},
+        )
+
+    def test_generic_control_expression_is_not_an_access(self) -> None:
+        nodes, _env, _state = _materialize(GENERIC_CONTROL)
+        self.assertEqual(nodes, [])
+
+    def test_cast_subscript_alias_records_a_limitation(self) -> None:
+        nodes, _env, state = _materialize(CAST_SUBSCRIPT_ALIAS)
+        self.assertEqual(nodes, [])
+        self.assertTrue(any(
+            limit.startswith("atomic_alias_unresolved")
+            for limit in state.get("atomic_limitations", ())))
 
     def test_renaming_and_formatting_do_not_change_the_result(self) -> None:
         nodes, env, _state = _materialize(RENAMED_REFORMATTED)
