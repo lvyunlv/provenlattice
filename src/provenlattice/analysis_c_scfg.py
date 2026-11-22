@@ -215,6 +215,67 @@ def _is_dereference_expression(expression: str) -> bool:
     return stripped.startswith("*") or "[" in stripped
 
 
+_UNEVALUATED_NODES = frozenset({
+    "sizeof_expression", "alignof_expression", "typeof_expression",
+})
+
+
+def _in_unevaluated_context(node) -> bool:
+    """Whether `node` is an operand the language does not evaluate.
+
+    `sizeof(g)` names `g` but reads nothing; publishing an access for it would
+    turn a compile-time query into a runtime race fact.
+    """
+    ancestor = node.parent
+    while ancestor is not None:
+        if ancestor.type in _UNEVALUATED_NODES:
+            return True
+        if ancestor.type in {"function_definition", "translation_unit"}:
+            return False
+        ancestor = ancestor.parent
+    return False
+
+
+def _unevaluated_spans(root) -> tuple[tuple[int, int], ...]:
+    """Byte spans of every unevaluated operand expression in the file."""
+    return tuple(
+        (node.start_byte, node.end_byte)
+        for node in _walk_tree(root)
+        if node.type in _UNEVALUATED_NODES
+    )
+
+
+def _inside_spans(byte: int, spans: tuple[tuple[int, int], ...]) -> bool:
+    return any(start <= byte < end for start, end in spans)
+
+
+def _root_is_dereferenced(node, source: bytes) -> bool:
+    """Whether `node` is the operand of a `*` through casts/parentheses.
+
+    `*(int *)p` puts a cast between the identifier and the dereference, so the
+    expression text recovered from the identifier alone does not start with
+    `*`. Walking the ancestor chain keeps the judgement on syntax.
+    """
+    current = node
+    while True:
+        parent = current.parent
+        if parent is None:
+            return False
+        if parent.type in {"parenthesized_expression", "cast_expression"}:
+            current = parent
+            continue
+        argument = parent.child_by_field_name("argument")
+        if (
+            parent.type == "pointer_expression"
+            and argument is not None
+            and argument.start_byte == current.start_byte
+            and argument.end_byte == current.end_byte
+            and source[parent.start_byte:parent.start_byte + 1] == b"*"
+        ):
+            return True
+        return False
+
+
 def _access_expression(node, source: bytes):
     """The whole access expression an identifier roots (`a[i]`, `*a`, `(a)`)."""
     current = node
@@ -251,7 +312,14 @@ def _subject_declaration(declarations, byte: int, subject: str, annotations):
 
 
 def _atomic_member(atomic, declarations, byte: int, declaration, member: str) -> bool:
-    if declarations is None or declaration is None or not member:
+    if not member:
+        return False
+    if (
+        declaration is not None
+        and atomic.is_atomic_member(declaration.type_token, member)
+    ):
+        return True
+    if declarations is None or declaration is None:
         return False
     member_declaration = declarations.resolve_member(byte, declaration.type_token, member)
     return atomic.is_atomic_declaration(member_declaration)
@@ -282,7 +350,9 @@ def _atomic_source_for_annotations(atomic, declarations, owners, byte: int, anno
             owner.end_byte if owner is not None else None,
             byte,
         )
-        if recovered is not None:
+        if recovered is not None and not _is_dereference_expression(
+            annotations.get("expression", "") or ""
+        ):
             return "type_specifier"
     return ""
 
@@ -319,12 +389,19 @@ def _atomic_candidate_key(candidate) -> tuple:
 
 def _collect_atomic_candidates(
     cfg, root, builder, declarations, owners, atomic, source: bytes, cpp: bool,
-) -> list[dict]:
-    """Existing access points plus a bounded scan for local atomic uses."""
+) -> tuple[list[dict], list[str]]:
+    """Existing access points plus a bounded scan for local atomic uses.
+
+    Returns the candidates and the scan's own limitations (currently the
+    unresolved-alias shapes that cannot be attributed to an atomic object).
+    """
 
     candidates: list[dict] = []
     covered: set[tuple] = set()
     covered_spans: set[tuple] = set()
+    limitations: list[str] = []
+    has_atomic_objects = bool(atomic.declaration_keys or atomic.recovered)
+    unevaluated = _unevaluated_spans(root)
 
     def append(owner, start_byte: int, end_byte: int, expression: str, annotations: dict) -> None:
         candidates.append({
@@ -349,6 +426,8 @@ def _collect_atomic_candidates(
         if point.event_type not in _ATOMIC_ACCESS_TYPES:
             continue
         if point.start_byte is None or point.end_byte is None:
+            continue
+        if _inside_spans(point.start_byte, unevaluated):
             continue
         annotations = cfg.annotations.get(point.key()) or {}
         if not annotations.get("subject"):
@@ -376,6 +455,8 @@ def _collect_atomic_candidates(
     for node in _walk_tree(root):
         if node.type != "identifier":
             continue
+        if _in_unevaluated_context(node):
+            continue
         if _is_callee(node) or _in_declaration_context(node):
             continue
         if _recovered_name_node(atomic, node):
@@ -400,6 +481,7 @@ def _collect_atomic_candidates(
         if span_key in covered_spans:
             continue
         atomic_source = ""
+        recovered = None
         if declaration is not None:
             if member:
                 if _atomic_member(atomic, declarations, node.start_byte, declaration, member):
@@ -417,11 +499,37 @@ def _collect_atomic_candidates(
         else:
             recovered = atomic.recovered_declaration(
                 subject, owner.start_byte, owner.end_byte, node.start_byte)
+            expression_text = _node_text(source, expression_node)
             if recovered is not None:
-                atomic_source = "type_specifier"
+                # `_Atomic(int *) p` makes the pointer object atomic, not the
+                # plain int it points at: only a non-dereference use of `p` is
+                # an atomic access.
+                if not _is_dereference_expression(expression_text):
+                    atomic_source = "type_specifier"
+                elif inside_region:
+                    atomic_source = "atomic_block"
             elif inside_region:
                 atomic_source = "atomic_block"
         if not atomic_source:
+            expression_text = _node_text(source, expression_node)
+            dereferenced = (
+                _is_dereference_expression(expression_text)
+                or _root_is_dereferenced(node, source)
+            )
+            if (
+                has_atomic_objects
+                and recovered is None
+                and dereferenced
+                and (
+                    declaration is None
+                    or declaration.type_token in {"", "void"}
+                )
+            ):
+                # A write/read through a pointer whose pointee type the graph
+                # cannot name may reach an atomic object. It is not an atomic
+                # fact; it is an explicit unknown.
+                limitations.append(
+                    f"atomic_alias_unresolved@{expression_node.start_byte}")
             continue
         access = _semantic_access_kind(
             expression_node, "DEREFERENCE", source, cpp=cpp)
@@ -444,7 +552,7 @@ def _collect_atomic_candidates(
         annotations["is_write"] = "true" if access in {"WRITE", "READ_MODIFY_WRITE"} else "false"
         append(owner, expression_node.start_byte, expression_node.end_byte, expression, annotations)
         covered.add(key)
-    return candidates
+    return candidates, limitations
 
 
 def _inject_atomic_points(cfg, candidates: list[dict], lines) -> int:
@@ -594,10 +702,12 @@ def analyze_c_scfg_scope(
                 out_param=VOCABULARY.out_param_names("ALLOC"),
             )
             cfg = builder.build(outcome.tree.root_node)
-            atomic_candidates = _collect_atomic_candidates(
+            atomic_candidates, atomic_scan_limitations = _collect_atomic_candidates(
                 cfg, outcome.tree.root_node, builder, declarations, owners,
                 atomic, source_bytes, profile.name == "cpp")
             atomic_published = _inject_atomic_points(cfg, atomic_candidates, lines)
+            atomic_limitations_all = tuple(sorted((
+                *atomic.limitations, *atomic_scan_limitations)))
             diagnostics = tree_diagnostics(outcome.tree.root_node)
 
             # -- publish: vocabulary events + walker points under one identity
@@ -695,7 +805,7 @@ def analyze_c_scfg_scope(
                         "scope": scope_path.as_posix(),
                         "event_count": len(nodes), "edge_count": len(edges),
                         "atomic_points": atomic_published,
-                        "atomic_limitations": list(atomic.limitations),
+                        "atomic_limitations": list(atomic_limitations_all),
                         "events_outside_owner": extractor.skipped_outside_owner,
                         "dependencies": {"events:cpp": EVENTS_CONTRACT},
                         **owner_counters,
@@ -715,7 +825,7 @@ def analyze_c_scfg_scope(
             counters["points_published"] += len(nodes)
             counters["edges_published"] += len(edges)
             counters["atomic_points_published"] += atomic_published
-            atomic_limitations.update(atomic.limitations)
+            atomic_limitations.update(atomic_limitations_all)
             counters["events_outside_owner"] += extractor.skipped_outside_owner
             counters["functions_bound"] += owner_counters["functions_bound"]
             counters["functions_unbound"] += owner_counters["functions_unbound"]

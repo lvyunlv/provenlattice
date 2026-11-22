@@ -391,7 +391,6 @@ ATOMIC_QUALIFIER = "_Atomic"
 VERIFIER_ATOMIC_BEGIN = "__VERIFIER_atomic_begin"
 VERIFIER_ATOMIC_END = "__VERIFIER_atomic_end"
 
-_ATOMIC_QUALIFIER_WORD = re.compile(r"\b_Atomic\b")
 # `_declarator_name` is stateless; the frontend instance is only the holder.
 _DECLARATOR_NAME = CFrontend()._declarator_name
 
@@ -423,6 +422,7 @@ class AtomicFacts:
 
     declaration_keys: frozenset[tuple[int, str]] = frozenset()
     pointee_keys: frozenset[tuple[int, str]] = frozenset()
+    member_keys: frozenset[tuple[str, str]] = frozenset()
     aliases: frozenset[str] = frozenset()
     recovered: tuple[AtomicDeclaration, ...] = ()
     regions: tuple[tuple[int, int], ...] = ()
@@ -433,6 +433,15 @@ class AtomicFacts:
             declaration is not None
             and (declaration.start_byte, declaration.name) in self.declaration_keys
         )
+
+    def is_atomic_member(self, type_token: str, member: str) -> bool:
+        """Whether `type_token`'s member `member` is declared atomic.
+
+        The type is the shallow token the declaration index records (a struct
+        tag or a typedef alias), so an anonymous `typedef struct {...} S;`
+        still names its field list through `S`.
+        """
+        return bool(type_token) and bool(member) and (type_token, member) in self.member_keys
 
     def is_atomic_pointee(self, declaration: Any) -> bool:
         """Whether the declaration is a one-level pointer to an atomic object.
@@ -530,10 +539,56 @@ def _type_definition_name(node: Any, source: bytes) -> str:
     return ""
 
 
+_AGGREGATE_NODES = frozenset({
+    "struct_specifier", "union_specifier", "enum_specifier",
+})
+
+
+def _typedef_underlying_children(node: Any, source: bytes) -> list[Any]:
+    """The typedef's type children, with the declared alias name removed.
+
+    `typedef struct { _Atomic int a; } S;` has the struct as its type and `S`
+    as its name; the alias is not atomic even though one of its *fields* is.
+    Keeping the name out of the type children is what lets the structural test
+    below look only at the type spelling.
+    """
+    name = _type_definition_name(node, source)
+    children = list(node.named_children)
+    for child in reversed(children):
+        if (
+            child.type in {"type_identifier", "identifier"}
+            and _node_text(source, child).strip() == name
+        ):
+            children.remove(child)
+            break
+    return children
+
+
+def _type_children_are_atomic(
+    children: list[Any], source: bytes, aliases: frozenset[str],
+) -> bool:
+    """Whether these type children spell `_Atomic` or a known atomic alias.
+
+    An aggregate with a body is deliberately *not* atomic: a qualifier inside
+    its field list qualifies a field, not the aggregate object.
+    """
+    for child in children:
+        if child.type in _AGGREGATE_NODES and child.child_by_field_name("body") is not None:
+            continue
+        if child.type == "type_qualifier" and _node_text(source, child).strip() == ATOMIC_QUALIFIER:
+            return True
+        if (
+            child.type == "type_identifier"
+            and _node_text(source, child).strip() in aliases
+        ):
+            return True
+    return False
+
+
 def _collect_atomic_aliases(root: Any, source: bytes) -> frozenset[str]:
     """Typedef names whose type is `_Atomic` (including alias-of-alias)."""
     definitions = [
-        (node, _type_definition_name(node, source), _node_text(source, node))
+        (node, _type_definition_name(node, source))
         for node in _walk_nodes(root) if node.type == "type_definition"
     ]
     definitions = [entry for entry in definitions if entry[1]]
@@ -541,11 +596,11 @@ def _collect_atomic_aliases(root: Any, source: bytes) -> frozenset[str]:
     changed = True
     while changed:
         changed = False
-        for _node, name, text in definitions:
+        for node, name in definitions:
             if name in aliases:
                 continue
-            if _ATOMIC_QUALIFIER_WORD.search(text) or any(
-                re.search(rf"\b{re.escape(alias)}\b", text) for alias in aliases
+            if _type_children_are_atomic(
+                _typedef_underlying_children(node, source), source, frozenset(aliases)
             ):
                 aliases.add(name)
                 changed = True
@@ -554,14 +609,11 @@ def _collect_atomic_aliases(root: Any, source: bytes) -> frozenset[str]:
 
 def _has_atomic_qualifier(node: Any, source: bytes, aliases: frozenset[str]) -> bool:
     type_node = node.child_by_field_name("type")
-    if type_node is not None and _ATOMIC_QUALIFIER_WORD.search(_node_text(source, type_node)):
+    if _type_children_are_atomic(
+        [type_node] if type_node is not None else [], source, aliases
+    ):
         return True
-    for child in node.named_children:
-        if child.type == "type_qualifier" and _node_text(source, child).strip() == ATOMIC_QUALIFIER:
-            return True
-        if child.type == "type_identifier" and _node_text(source, child).strip() in aliases:
-            return True
-    return False
+    return _type_children_are_atomic(list(node.named_children), source, aliases)
 
 
 def _pointer_level(declarator: Any) -> int | None:
@@ -650,6 +702,13 @@ def _collect_recovered_atomic(
         if not text.startswith(ATOMIC_QUALIFIER) or "(" not in text:
             continue
         names = [child for child in node.named_children if child.type == "identifier"]
+        # `_Atomic(int) x = y;` arrives as one ERROR node whose top-level
+        # identifiers include both the declarator `x` and the initializer `y`.
+        # Only the identifiers before the `=` are declarations; treating `y` as
+        # one would mark an ordinary object atomic at every later use.
+        equals = source.find(b"=", node.start_byte, node.end_byte)
+        if equals != -1:
+            names = [name_node for name_node in names if name_node.start_byte < equals]
         if not names:
             limitations.append(f"atomic_type_specifier_unresolved@{node.start_byte}")
             continue
@@ -676,17 +735,39 @@ def _enclosing_compound(node: Any) -> Any:
     return None
 
 
+def _direct_statement_of(node: Any, compound: Any) -> bool:
+    """Whether `node` is the call of a statement directly inside `compound`.
+
+    A call under an `if`, a loop, or any other nested construct is conditional:
+    the region it appears to open may not execute on every path through the
+    block, so pairing it with an unconditional end would fabricate atomicity.
+    """
+    parent = node.parent
+    grandparent = parent.parent if parent is not None else None
+    return (
+        compound is not None
+        and parent is not None
+        and parent.type == "expression_statement"
+        and grandparent is not None
+        and grandparent.type == "compound_statement"
+        and grandparent.start_byte == compound.start_byte
+        and grandparent.end_byte == compound.end_byte
+    )
+
+
 def _collect_atomic_regions(
     root: Any, source: bytes, owners: Any,
 ) -> tuple[tuple[tuple[int, int], ...], tuple[str, ...]]:
     """Pair `__VERIFIER_atomic_begin/end` calls inside one owner.
 
-    A pair is strong only when it is sequential and both calls sit in the same
-    compound statement. A nested begin invalidates the open pair and itself;
-    an end in a different block is interleaved; an unmatched call is unpaired.
-    Every rejected shape is a named limitation -- none becomes ATOMIC.
+    A pair is strong only when it is sequential, both calls sit in the same
+    compound statement, and each call is a direct statement of that compound.
+    A nested begin invalidates the open pair and itself; a conditional call, an
+    end in a different block, and an unmatched call are named limitations --
+    none becomes ATOMIC.
     """
     calls: list[tuple[int, int, str, int, tuple[int | None, int | None]]] = []
+    limitations: list[str] = []
     for node in _walk_nodes(root):
         if node.type != "call_expression":
             continue
@@ -697,6 +778,9 @@ def _collect_atomic_regions(
         if name not in {VERIFIER_ATOMIC_BEGIN, VERIFIER_ATOMIC_END}:
             continue
         compound = _enclosing_compound(node)
+        if not _direct_statement_of(node, compound):
+            limitations.append(f"atomic_block_conditional@{node.start_byte}")
+            continue
         owner = _owner_span(owners, node.start_byte, node.end_byte)
         calls.append((
             node.start_byte, node.end_byte, name,
@@ -710,7 +794,6 @@ def _collect_atomic_regions(
         groups.setdefault(owner, []).append((start, end, name, compound))
 
     regions: list[tuple[int, int]] = []
-    limitations: list[str] = []
     for owner, ordered in groups.items():
         stack: list[tuple[int, int, int, bool]] = []  # (start, end, compound, valid)
         for start, end, name, compound in ordered:
@@ -740,6 +823,55 @@ def _collect_atomic_regions(
     return tuple(sorted(regions)), tuple(limitations)
 
 
+def _collect_atomic_members(
+    root: Any, source: bytes, aliases: frozenset[str],
+) -> frozenset[tuple[str, str]]:
+    """`(type token, member)` pairs whose member is declared atomic.
+
+    `typedef struct { _Atomic int a; int b; } S; S s; s.a` is an atomic access
+    while `s.b` is not, and the declaration index cannot answer that for an
+    anonymous aggregate typedef: its fields are not reachable from `S` through
+    `resolve_member`. The member list is therefore recorded per type token --
+    a struct tag or any typedef name that wraps the aggregate.
+    """
+    members: set[tuple[str, str]] = set()
+    aggregates: list[tuple[int, int, set[str]]] = []
+    for node in _walk_nodes(root):
+        if node.type not in {"struct_specifier", "union_specifier"}:
+            continue
+        body = node.child_by_field_name("body")
+        if body is None:
+            continue
+        names: set[str] = set()
+        for field in body.named_children:
+            if field.type != "field_declaration":
+                continue
+            if not _has_atomic_qualifier(field, source, aliases):
+                continue
+            for declarator in field.children_by_field_name("declarator"):
+                name = _DECLARATOR_NAME(declarator, source)
+                if name:
+                    names.add(name)
+        if not names:
+            continue
+        tag_node = node.child_by_field_name("name")
+        if tag_node is not None:
+            tag = _node_text(source, tag_node).strip()
+            if tag:
+                members.update((tag, name) for name in names)
+        aggregates.append((node.start_byte, node.end_byte, names))
+    for node in _walk_nodes(root):
+        if node.type != "type_definition":
+            continue
+        alias = _type_definition_name(node, source)
+        if not alias:
+            continue
+        for start, end, names in aggregates:
+            if node.start_byte <= start and end <= node.end_byte:
+                members.update((alias, name) for name in names)
+    return frozenset(members)
+
+
 def collect_atomic_facts(root: Any, source: bytes, owners: Any = None) -> AtomicFacts:
     """Collect the file's atomic declaration/region facts (issue-pilot#89)."""
     aliases = _collect_atomic_aliases(root, source)
@@ -750,6 +882,7 @@ def collect_atomic_facts(root: Any, source: bytes, owners: Any = None) -> Atomic
     return AtomicFacts(
         declaration_keys=declaration_keys,
         pointee_keys=pointee_keys,
+        member_keys=_collect_atomic_members(root, source, aliases),
         aliases=aliases,
         recovered=recovered,
         regions=regions,

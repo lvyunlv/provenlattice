@@ -191,6 +191,49 @@ void touch(void *p) {
 }
 """
 
+RECOVERED_WITH_INITIALIZER = r"""
+int y = 0;
+_Atomic(int) x = y;
+void bump(void) {
+    y = 1;
+    x = 2;
+}
+"""
+
+STRUCT_WITH_ATOMIC_FIELD = r"""
+typedef struct { _Atomic int a; int b; } S;
+S s;
+void touch(void) {
+    s.a = 1;
+    s.b = 2;
+}
+"""
+
+ATOMIC_POINTER_OBJECT = r"""
+_Atomic(int *) p;
+int *q;
+void touch(void) {
+    p = q;
+    *p = 1;
+}
+"""
+
+CONDITIONAL_BLOCK = r"""
+int g_value = 0;
+void touch(int c) {
+    if (c) __VERIFIER_atomic_begin();
+    g_value++;
+    __VERIFIER_atomic_end();
+}
+"""
+
+SIZEOF_OPERAND = r"""
+_Atomic int g_value = 0;
+int size(void) {
+    return sizeof(g_value);
+}
+"""
+
 RENAMED_REFORMATTED = r"""
 #include <pthread.h>
 
@@ -273,8 +316,51 @@ class AtomicEventTests(unittest.TestCase):
             _annotations(nodes[0]).get("atomic_source"), "type_specifier")
 
     def test_access_through_void_alias_is_not_atomic(self) -> None:
-        nodes, _env, _state = _materialize(VOID_ALIAS)
+        nodes, _env, state = _materialize(VOID_ALIAS)
         self.assertEqual(nodes, [], "an unresolved alias must stay unknown")
+        self.assertTrue(
+            any(
+                limit.startswith("atomic_alias_unresolved")
+                for limit in state.get("atomic_limitations", ())
+            ),
+            "the unresolved alias must be an explicit limitation",
+        )
+
+    def test_recovered_initializer_is_not_a_declaration(self) -> None:
+        nodes, _env, _state = _materialize(RECOVERED_WITH_INITIALIZER)
+        self.assertEqual(_subjects(nodes), {"x"})
+
+    def test_atomic_field_does_not_make_the_aggregate_atomic(self) -> None:
+        nodes, _env, _state = _materialize(STRUCT_WITH_ATOMIC_FIELD)
+        pairs = {
+            (
+                _annotations(node).get("subject", ""),
+                _annotations(node).get("subject_member", ""),
+            )
+            for node in nodes
+        }
+        self.assertEqual(pairs, {("s", "a")})
+
+    def test_dereferencing_an_atomic_pointer_is_not_atomic(self) -> None:
+        nodes, _env, state = _materialize(ATOMIC_POINTER_OBJECT)
+        self.assertTrue(nodes)
+        self.assertEqual(_subjects(nodes), {"p"})
+        self.assertEqual(
+            {_annotations(node).get("expression", "") for node in nodes}, {"p"})
+        self.assertFalse(any(
+            limit.startswith("atomic_alias_unresolved")
+            for limit in state.get("atomic_limitations", ())))
+
+    def test_conditional_begin_is_a_limitation(self) -> None:
+        nodes, _env, state = _materialize(CONDITIONAL_BLOCK)
+        self.assertEqual(nodes, [])
+        self.assertTrue(any(
+            limit.startswith("atomic_block_conditional")
+            for limit in state.get("atomic_limitations", ())))
+
+    def test_sizeof_operand_is_not_an_access(self) -> None:
+        nodes, _env, _state = _materialize(SIZEOF_OPERAND)
+        self.assertEqual(nodes, [])
 
     def test_renaming_and_formatting_do_not_change_the_result(self) -> None:
         nodes, env, _state = _materialize(RENAMED_REFORMATTED)
