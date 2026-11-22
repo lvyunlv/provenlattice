@@ -197,10 +197,11 @@ def _lock_designation(source: bytes, node) -> tuple[str, bool]:
     is `.` because the identity is read by humans and by lock-order queries
     alike, and `a.nextmutex` would be ambiguous where `a.next.mutex` is not.
 
-    `this->m_` is the field itself, matching the sparse walker's convention:
-    the member name is the whole designation.  A call expression or any other
-    non-name terminates the path without a designation, so the answer stays
-    fail-closed instead of naming a function as a lock.
+    `this->m_` is left unresolved.  The events layer has no field-declaration
+    identity, so the bare member name would silently merge a member lock with
+    a same-named local lock in the same method -- an exactness claim the layer
+    cannot back.  Keeping it empty and inexact is the honest answer until a
+    declaration identity is available here.
     """
     node = _unwrap_parentheses(node)
     pieces: list[str] = []
@@ -224,7 +225,7 @@ def _lock_designation(source: bytes, node) -> tuple[str, bool]:
             node = _unwrap_parentheses(node)
             continue
         if kind == "this":
-            return (".".join(pieces), True) if pieces else ("", False)
+            return "", False
         break
     if node is None:
         return "", False
@@ -247,7 +248,9 @@ def _lock_subject(source: bytes, node, event_type: str) -> tuple[str, bool]:
     (`pthread_mutex_lock(&m)` -> `m`); a member call names its receiver
     (`m.lock()` -> `m`).  Member paths are kept at member level when they are
     field selections (`&s->mutex` -> `s.mutex`); a subscript path stays on its
-    root and is marked inexact (`p->slots[i]` names `p`, not one lock).
+    root and is marked inexact (`p->slots[i]` names `p`, not one lock); a
+    `this->` path stays unresolved because this layer has no field-declaration
+    identity to separate it from a same-named local.
     """
     if event_type in {"LOCK", "UNLOCK"} and node.type == "declaration":
         return _lock_designation(source, _declaration_argument_node(node))

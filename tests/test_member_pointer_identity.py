@@ -9,6 +9,9 @@ Pins the events-layer fact this Issue delivers:
   the root and stays inexact, so two array elements never read as one lock;
 * a designation that is not a name (``pthread_mutex_lock(get_lock())``) stays
   empty and inexact;
+* a ``this->member`` designation also stays empty and inexact: the events
+  layer has no field-declaration identity, so the bare member name would
+  merge with a same-named local lock;
 * plain root locks (``&g_lock``, ``m.try_lock()``, ``guard(m)``) are unchanged;
 * the sparse access subject is not touched: ``s.datum`` keeps its existing
   ``(subject_decl, subject_member)`` pair.
@@ -19,6 +22,7 @@ import unittest
 from pathlib import Path
 
 from provenlattice.analysis_query import query_analysis
+from provenlattice.concurrency_lock_scenarios import build_lock_scenarios
 from provenlattice.graph import full_index
 from provenlattice.orchestrator import analyze_scope
 
@@ -183,6 +187,64 @@ class RaiiMemberLockTests(MemberPointerIdentityBase):
         self.assertEqual(lock["lock_identity"], "g_s.mutex")
         self.assertTrue(lock["subject_exact"])
         self.assertTrue(lock["raii"])
+
+
+class ThisMemberIsNotResolvedTests(MemberPointerIdentityBase):
+    def test_this_member_without_shadowing_stays_unresolved(self) -> None:
+        write(self.root, "src/this_only.cc",
+              "#include <mutex>\n"
+              "struct S {\n"
+              "    std::mutex m;\n"
+              "    void f(void) {\n"
+              "        this->m.lock();\n"
+              "        this->m.unlock();\n"
+              "    }\n"
+              "};\n")
+        self.analyze()
+        locks = sorted(self.locks("src/this_only.cc"),
+                       key=lambda event: event.get("start_byte") or 0)
+        self.assertEqual(len(locks), 2)
+        for lock in locks:
+            self.assertEqual(lock["lock_identity"], "")
+            self.assertFalse(lock["subject_exact"])
+
+    def test_member_does_not_merge_with_a_same_named_local(self) -> None:
+        write(self.root, "src/this_shadow.cc",
+              "#include <mutex>\n"
+              "struct S {\n"
+              "    std::mutex m;\n"
+              "    void f(void) {\n"
+              "        std::mutex m;\n"
+              "        m.lock();\n"
+              "        this->m.lock();\n"
+              "        this->m.unlock();\n"
+              "        m.unlock();\n"
+              "    }\n"
+              "};\n")
+        self.analyze()
+        locks = sorted(self.locks("src/this_shadow.cc"),
+                       key=lambda event: event.get("start_byte") or 0)
+        self.assertEqual(
+            [(lock["lock_identity"], lock["subject_exact"]) for lock in locks],
+            [("m", True), ("", False), ("", False), ("m", True)],
+        )
+
+    def test_local_and_member_locks_do_not_form_a_self_deadlock(self) -> None:
+        write(self.root, "src/this_scenario.cc",
+              "#include <mutex>\n"
+              "struct S {\n"
+              "    std::mutex m;\n"
+              "    void f(void) {\n"
+              "        std::mutex m;\n"
+              "        m.lock();\n"
+              "        this->m.lock();\n"
+              "        this->m.unlock();\n"
+              "        m.unlock();\n"
+              "    }\n"
+              "};\n")
+        self.analyze()
+        scenarios = build_lock_scenarios(self.events("src/this_scenario.cc"))
+        self.assertEqual(scenarios["candidates"], [])
 
 
 class AccessSubjectUnchangedTests(MemberPointerIdentityBase):
