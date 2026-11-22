@@ -225,6 +225,21 @@ class NestedReceiverCallTests(CrossFunctionCallScopeBase):
             ["cross_function_call" in record["limitation"] for record in records],
             [False, True, False],
         )
+    def test_legacy_receiver_classification_stays_start_byte_based(self) -> None:
+        cfg = query_analysis(
+            self.root, "sparse_cfg", file_path=self.TARGET, database=self.database)
+        events = query_analysis(
+            self.root, "events", file_path=self.TARGET, database=self.database)
+        legacy = build_access_lockset(
+            cfg["events"], cfg["edges"], events["events"])
+        records = [
+            record for record in legacy["access_locksets"]
+            if record["subject"] == "shared" and record["event_type"] == "WRITE"
+        ]
+        self.assertTrue(all(
+            "cross_function_call" not in record["limitation"]
+            for record in records
+        ))
 
 
 class SameLineCallTests(OpaqueCallAssertions, CrossFunctionCallScopeBase):
@@ -315,6 +330,35 @@ class LegacyCallInputTests(CrossFunctionCallScopeBase):
         )
 
 
+class LegacyByteSpanCompatibilityTests(CrossFunctionCallScopeBase):
+    FIXTURE = (
+        "#include <pthread.h>\n"
+        "pthread_mutex_t m; int shared;\n"
+        "void worker(void){pthread_mutex_lock(&m); shared++; pthread_mutex_unlock(&m);}\n"
+    )
+
+    def build(self, **additive_inputs) -> dict:
+        cfg = query_analysis(
+            self.root, "sparse_cfg", file_path="src/a.c", database=self.database)
+        events = query_analysis(
+            self.root, "events", file_path="src/a.c", database=self.database)
+        return build_access_lockset(
+            cfg["events"], cfg["edges"], events["events"], **additive_inputs)
+
+    def test_omitted_call_input_retains_legacy_lockset_and_relation(self) -> None:
+        legacy = self.build()
+        records = [
+            record for record in legacy["access_locksets"]
+            if record["subject"] == "shared" and record["event_type"] == "WRITE"
+        ]
+        self.assertEqual([record["held_locks"] for record in records], [[]])
+        self.assertTrue(any(
+            relation["relation"] == "DIFFERENT_LOCK"
+            and relation["subject"] == "global:shared"
+            for relation in legacy["relations"]
+        ))
+
+
 class ReacquireWithoutReleaseTests(CrossFunctionCallScopeBase):
     FIXTURE = (
         "#include <pthread.h>\n"
@@ -335,6 +379,37 @@ class ReacquireWithoutReleaseTests(CrossFunctionCallScopeBase):
             [record["limitation"] for record in self.accesses()],
             [["cross_function_call"]],
         )
+
+
+class MayFailReacquireTests(CrossFunctionCallScopeBase):
+    FIXTURE = (
+        "#include <pthread.h>\n"
+        "pthread_mutex_t m;\n"
+        "int shared;\n"
+        "void opaque(void);\n"
+        "void try_worker(void) {\n"
+        "    pthread_mutex_trylock(&m);\n"
+        "    opaque();\n"
+        "    pthread_mutex_lock(&m);\n"
+        "    shared++;\n"
+        "    pthread_mutex_unlock(&m);\n"
+        "}\n"
+        "void timed_worker(void) {\n"
+        "    pthread_mutex_timedlock(&m, 0);\n"
+        "    opaque();\n"
+        "    pthread_mutex_lock(&m);\n"
+        "    shared++;\n"
+        "    pthread_mutex_unlock(&m);\n"
+        "}\n"
+    )
+
+    def test_successful_may_fail_acquire_makes_blocking_reacquire_nested(self) -> None:
+        records = self.accesses()
+        self.assertEqual(len(records), 2)
+        for record in records:
+            with self.subTest(owner=record["owner"]):
+                self.assertEqual(record["held_locks"], ["global:m"])
+                self.assertEqual(record["limitation"], ["cross_function_call"])
 
 
 class CallArgumentTests(CrossFunctionCallScopeBase):
@@ -654,6 +729,17 @@ class FlowSuccessorTests(unittest.TestCase):
             "start_line": 2, "end_line": 2, "start_byte": 105, "end_byte": 110,
         }
         self.assertEqual(_flow_successor(access, self.THREADED), "a_inner")
+    def test_legacy_mode_retains_id_tie_break(self) -> None:
+        threaded = {
+            "a_outer": self.THREADED["z_outer"],
+            "z_inner": self.THREADED["a_inner"],
+        }
+        access = {
+            "start_line": 1, "end_line": 1, "start_byte": 80, "end_byte": 90,
+        }
+        self.assertEqual(_flow_successor(access, threaded), "z_inner")
+        self.assertEqual(
+            _flow_successor(access, threaded, byte_spans=False), "a_outer")
 
 
 class DataflowConvergenceTests(unittest.TestCase):

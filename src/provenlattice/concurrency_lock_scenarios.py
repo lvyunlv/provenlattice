@@ -578,15 +578,21 @@ def _threaded_dataflow(
     # that bound (possible only through loops), UNLOCK keeps the saturated
     # state: conservative over-approximation is preferable to losing an outer
     # interval. Ordinary acquisitions/releases still reset at exact depth 0.
-    explicit_acquires = {
+    # Track every potentially successful explicit acquisition in the may
+    # analysis. try/timed still stay out of the must-held projection, but their
+    # success path holds the lock across a CALL and makes a later blocking
+    # acquisition nested rather than fresh.
+    may_acquires = {
         nid for nid in ids
         if threaded[nid].get("event_type") == _LOCK
-        and (lock_by_id.get(nid) or {}).get("acquire_kind") == _ACQUIRE_BLOCKING
+        and (lock_by_id.get(nid) or {}).get("acquire_kind") in (
+            _ACQUIRE_BLOCKING, _ACQUIRE_TRY, _ACQUIRE_TIMED,
+        )
         and not (lock_by_id.get(nid) or {}).get("raii")
         and (lock_by_id.get(nid) or {}).get("subject_exact")
         and (lock_by_id.get(nid) or {}).get("lock_identity")
     }
-    depth_cap = len(explicit_acquires) + 1
+    depth_cap = len(may_acquires) + 1
 
     def depth_transfer(
         nid: str, depths: Mapping[str, int],
@@ -597,7 +603,7 @@ def _threaded_dataflow(
         event_type = node.get("event_type")
         fact = lock_by_id.get(nid)
         identity = (fact or {}).get("lock_identity")
-        if nid in explicit_acquires:
+        if nid in may_acquires:
             result = dict(depths)
             result[identity] = min(depth_cap, depths.get(identity, 0) + 1)
             return result
@@ -656,17 +662,33 @@ def _threaded_dataflow(
 
 
 def _flow_successor(
-    access: Mapping[str, Any], threaded: Mapping[str, Mapping[str, Any]]
+    access: Mapping[str, Any], threaded: Mapping[str, Mapping[str, Any]],
+    *, byte_spans: bool = True,
 ) -> str | None:
     """The threaded point an access point flows into, or None for the exit.
 
     An access inside a threaded statement's span is an argument/sub-expression
     of that statement, so it "flows into" the statement itself. An access on
     its own edgeless statement flows into the next threaded point in source
-    order (or the method exit when there is none).
+    order (or the method exit when there is none). ``byte_spans=False`` is the
+    frozen legacy projection used when the additive call input is omitted.
     """
     lo = int(access.get("start_line") or 0)
     hi = int(access.get("end_line") or lo)
+    if not byte_spans:
+        for nid in sorted(threaded):
+            node = threaded[nid]
+            s = int(node.get("start_line") or 0)
+            e = int(node.get("end_line") or s)
+            if s <= lo and hi <= e:
+                return nid
+        for nid in sorted(
+            threaded,
+            key=lambda key: (int(threaded[key].get("start_line") or 0), key),
+        ):
+            if int(threaded[nid].get("start_line") or 0) > hi:
+                return nid
+        return None
     start_byte = int(access.get("start_byte") or 0)
     end_byte = int(access.get("end_byte") or 0)
     # Nested CALLs can all contain the same access. The innermost statement
@@ -921,8 +943,16 @@ def build_access_lockset(
         # Only an ordinary CALL whose unique resolved target is proven
         # transitively lock-free is transparent. Everything else is opaque,
         # including an omitted additive call input (the legacy caller path).
-        known_call_spans = {
-            (int(ev.get("start_byte") or 0), int(ev.get("end_byte") or 0))
+        def call_position(ev: Mapping[str, Any]) -> tuple[int, ...]:
+            if legacy_call_limitations:
+                return (int(ev.get("start_byte") or 0),)
+            return (
+                int(ev.get("start_byte") or 0),
+                int(ev.get("end_byte") or 0),
+            )
+
+        known_call_positions = {
+            call_position(ev)
             for ev in threaded.values()
             if ev.get("event_type") in _KNOWN_CALL_KINDS
         }
@@ -930,10 +960,7 @@ def build_access_lockset(
         for eid, ev in threaded.items():
             if (
                 ev.get("event_type") == "CALL"
-                and (
-                    int(ev.get("start_byte") or 0),
-                    int(ev.get("end_byte") or 0),
-                ) not in known_call_spans
+                and call_position(ev) not in known_call_positions
             ):
                 key = (
                     str(ev.get("file_id") or ""), owner,
@@ -969,7 +996,8 @@ def build_access_lockset(
             accesses.items(),
             key=lambda pair: (int(pair[1].get("start_byte") or 0), pair[0]),
         ):
-            successor = _flow_successor(ev, threaded)
+            successor = _flow_successor(
+                ev, threaded, byte_spans=not legacy_call_limitations)
             held = held_in[successor] if successor is not None else held_in[_EXIT]
             # A RAII guard held over this access's byte position protects it:
             # the lock is held from its declaration to its scope end (Issue #69),
