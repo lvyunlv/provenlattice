@@ -33,10 +33,12 @@ thread-pool analysis.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .analysis_query import query_analysis
-from .concurrency_lock_scenarios import build_access_lockset
+from .concurrency_lock_scenarios import _KNOWN_CALL_KINDS, build_access_lockset
 from .models import (
     STORAGE_FIELD,
     STORAGE_FILE_STATIC,
@@ -44,6 +46,7 @@ from .models import (
     STORAGE_GLOBAL,
     STORAGE_UNKNOWN,
 )
+from .storage import SQLiteStorage
 
 # The storage classes whose subject can name genuinely shared, cross-thread
 # state. `local` and `parameter` are frame-scoped and cannot be half of a
@@ -289,6 +292,188 @@ def query_concurrency_context(
     return context
 
 
+def _resolved_call_target(row: Mapping[str, Any]) -> str:
+    """A unique direct CALL target, or empty for every unknown shape."""
+    metadata = row.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            return ""
+    if not isinstance(metadata, Mapping):
+        return ""
+    if (
+        row.get("status") != "resolved"
+        or not row.get("resolved_symbol_id")
+        or metadata.get("call_kind") != "direct"
+        # The C++ frontend's legacy rows label even function-pointer calls
+        # direct. Only the C syntax classifier provides a trustworthy shape.
+        or metadata.get("callee_shape") not in {"identifier", "qualified"}
+    ):
+        return ""
+    return str(row["resolved_symbol_id"])
+
+
+def _call_lock_inputs(
+    repo, database, env: Mapping[str, Any], lock_env: Mapping[str, Any],
+) -> tuple[dict[tuple[str, str, int], str | None], frozenset[str]]:
+    """Resolve CALL sites and compute a conservative lock-free callee set.
+
+    Only materialized, current events for an actual function definition can
+    prove the absence of reachable lock operations. The greatest fixed point
+    keeps fully resolved lock-free cycles lock-free, while a direct lock,
+    ambiguous join, indirect call, declaration-only target or unavailable body
+    removes the owner and all of its callers from that set.
+    """
+    root = Path(repo).resolve()
+    database = (
+        Path(database).resolve() if database
+        else root / ".provenlattice" / "codegraph.db"
+    )
+    current_file = str(env.get("file_id") or "")
+    call_callees: dict[tuple[str, str, int], str | None] = {}
+    with SQLiteStorage(database) as storage:
+        references_by_key: dict[tuple[str, str, int], list[dict]] = {}
+        for row in storage.rows(
+            "SELECT id, file_id, owner_symbol_id, start_line, raw_name, "
+            "status, resolved_symbol_id, metadata FROM raw_references "
+            "WHERE reference_type='CALLS' ORDER BY id"
+        ):
+            if row["start_line"] is None:
+                continue
+            key = (
+                str(row["file_id"]), str(row["owner_symbol_id"]),
+                int(row["start_line"]),
+            )
+            references_by_key.setdefault(key, []).append(row)
+
+        pending: list[str] = []
+        for key in sorted(references_by_key):
+            rows = references_by_key[key]
+            target = _resolved_call_target(rows[0]) if len(rows) == 1 else ""
+            if key[0] == current_file:
+                call_callees[key] = target or None
+                if target:
+                    pending.append(target)
+
+        node_cache: dict[str, dict | None] = {}
+        event_cache: dict[str, Mapping[str, Any] | None] = {}
+        # owner -> (has a direct lock operation, resolved ordinary callees).
+        # None callees means that no-lock reachability cannot be proven.
+        summaries: dict[str, tuple[bool, tuple[str, ...] | None]] = {}
+
+        def node(symbol_id: str) -> dict | None:
+            if symbol_id not in node_cache:
+                row = storage.row(
+                    "SELECT n.id, n.kind, n.file_id, n.metadata, f.path "
+                    "FROM nodes n JOIN files f ON f.file_id=n.file_id "
+                    "WHERE n.id=?", (symbol_id,),
+                )
+                if row is not None:
+                    try:
+                        row["metadata"] = json.loads(row["metadata"] or "{}")
+                    except (TypeError, ValueError):
+                        row = None
+                node_cache[symbol_id] = row
+            return node_cache[symbol_id]
+
+        def event_file(file_id: str, path: str) -> Mapping[str, Any] | None:
+            if file_id not in event_cache:
+                if file_id == current_file:
+                    candidate = lock_env
+                else:
+                    candidate = query_analysis(
+                        root, "events", file_path=path, database=database)
+                coverage = candidate.get("coverage") or {}
+                if (
+                    candidate.get("status") != "available"
+                    or coverage.get("analysis_status") != "complete"
+                    or coverage.get("partial")
+                ):
+                    event_cache[file_id] = None
+                else:
+                    event_cache[file_id] = candidate
+            return event_cache[file_id]
+
+        while pending:
+            symbol_id = pending.pop()
+            if symbol_id in summaries:
+                continue
+            symbol = node(symbol_id)
+            if (
+                symbol is None
+                or symbol["kind"] not in {"Function", "Method"}
+                or symbol["metadata"].get("definition") is not True
+            ):
+                summaries[symbol_id] = (False, None)
+                continue
+            file_env = event_file(symbol["file_id"], symbol["path"])
+            if file_env is None:
+                summaries[symbol_id] = (False, None)
+                continue
+            events = [
+                event for event in file_env.get("events", [])
+                if event.get("owner_symbol_id") == symbol_id
+            ]
+            if any(event.get("event_type") in {"LOCK", "UNLOCK"} for event in events):
+                summaries[symbol_id] = (True, ())
+                continue
+
+            known_call_spans = {
+                (int(event.get("start_byte") or 0), int(event.get("end_byte") or 0))
+                for event in events
+                if event.get("event_type") in _KNOWN_CALL_KINDS
+            }
+            calls_by_line: dict[int, int] = {}
+            for event in events:
+                if (
+                    event.get("event_type") == "CALL"
+                    and (
+                        int(event.get("start_byte") or 0),
+                        int(event.get("end_byte") or 0),
+                    ) not in known_call_spans
+                ):
+                    line = int(event.get("start_line") or 0)
+                    calls_by_line[line] = calls_by_line.get(line, 0) + 1
+            if any(count != 1 for count in calls_by_line.values()):
+                summaries[symbol_id] = (False, None)
+                continue
+
+            callees: list[str] = []
+            unknown = False
+            for line in sorted(calls_by_line):
+                key = (str(symbol["file_id"]), symbol_id, line)
+                rows = references_by_key.get(key, [])
+                target = _resolved_call_target(rows[0]) if len(rows) == 1 else ""
+                if not target:
+                    unknown = True
+                    break
+                callees.append(target)
+            summaries[symbol_id] = (
+                False, None if unknown else tuple(callees))
+            if not unknown:
+                pending.extend(callees)
+
+        lock_free = {
+            symbol_id
+            for symbol_id, (direct_lock, callees) in summaries.items()
+            if not direct_lock and callees is not None
+        }
+        while True:
+            remove = {
+                symbol_id for symbol_id in lock_free
+                if any(
+                    callee not in lock_free
+                    for callee in (summaries[symbol_id][1] or ())
+                )
+            }
+            if not remove:
+                break
+            lock_free.difference_update(remove)
+
+    return call_callees, frozenset(lock_free)
+
+
 def query_access_lockset(
     repo, file_path: str | None = None, database=None,
 ) -> dict:
@@ -306,10 +491,14 @@ def query_access_lockset(
     lock_env = query_analysis(repo, "events", file_path=file_path, database=database)
     if lock_env["status"] != "available":
         return {"status": lock_env["status"], "reason": lock_env.get("reason")}
+    call_callees, lock_free_callees = _call_lock_inputs(
+        repo, database, env, lock_env)
     bundle = build_access_lockset(
         env.get("events", []),
         env.get("edges", []),
         lock_env.get("events", []),
+        call_callees=call_callees,
+        lock_free_callees=lock_free_callees,
     )
     bundle["status"] = "available"
     return bundle
