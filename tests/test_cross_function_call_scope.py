@@ -907,5 +907,111 @@ class DefectQueryWiringTests(CrossFunctionCallScopeBase):
             result["coverage"].get("disqualified_same_lock", 0), 0)
 
 
+class CrossFileExplicitPrototypeTests(CrossFunctionCallScopeBase):
+    """A caller-local prototype resolves to the definition in another file."""
+
+    FIXTURES = {
+        "src/a.c": (
+            "#include <pthread.h>\n"
+            "pthread_mutex_t m;\n"
+            "int shared;\n"
+            "void helper(void);\n"
+            "void first(void) {\n"
+            "    pthread_mutex_lock(&m);\n"
+            "    shared++;\n"
+            "    helper();\n"
+            "    shared++;\n"
+            "    pthread_mutex_unlock(&m);\n"
+            "}\n"
+            "void second(void) {\n"
+            "    pthread_mutex_lock(&m);\n"
+            "    shared++;\n"
+            "    pthread_mutex_unlock(&m);\n"
+            "}\n"
+        ),
+        "src/helper.c": "void helper(void) {}\n",
+    }
+
+    def test_explicit_prototype_follows_cross_file_definition(self) -> None:
+        records = self.accesses()
+        self.assertTrue(records)
+        self.assertTrue(all(not record["limitation"] for record in records))
+        self.assertTrue(any(
+            relation["relation"] == "SAME_LOCK"
+            and relation["subject"] == "global:shared"
+            for relation in self.lockset()["relations"]
+        ))
+
+
+class MissingDefinitionTests(CrossFunctionCallScopeBase):
+    FIXTURE = (
+        "#include <pthread.h>\n"
+        "pthread_mutex_t m;\n"
+        "int shared;\n"
+        "void helper(void);\n"
+        "void first(void) {\n"
+        "    pthread_mutex_lock(&m);\n"
+        "    shared++;\n"
+        "    helper();\n"
+        "    shared++;\n"
+        "    pthread_mutex_unlock(&m);\n"
+        "}\n"
+        "void second(void) {\n"
+        "    pthread_mutex_lock(&m);\n"
+        "    shared++;\n"
+        "    pthread_mutex_unlock(&m);\n"
+        "}\n"
+    )
+
+    def test_declaration_without_definition_stays_fail_closed(self) -> None:
+        self.assertTrue(any(
+            "cross_function_call" in record["limitation"]
+            for record in self.accesses()
+        ))
+
+
+class AmbiguousDefinitionTests(CrossFunctionCallScopeBase):
+    FIXTURES = {
+        "src/a.c": MissingDefinitionTests.FIXTURE,
+        "src/one.c": "void helper(void) {}\n",
+        "src/two.c": "void helper(void) {}\n",
+    }
+
+    def test_two_definitions_stay_fail_closed(self) -> None:
+        self.assertTrue(any(
+            "cross_function_call" in record["limitation"]
+            for record in self.accesses()
+        ))
+
+
+class SameLineKnownCallTests(CrossFunctionCallScopeBase):
+    """A known vocabulary call must not make its line ambiguous."""
+
+    FIXTURE = (
+        "#include <pthread.h>\n"
+        "pthread_mutex_t m;\n"
+        "int shared;\n"
+        "void helper(void) {}\n"
+        "void first(void) {\n"
+        "    pthread_mutex_lock(&m); helper();\n"
+        "    shared++;\n"
+        "    pthread_mutex_unlock(&m);\n"
+        "}\n"
+        "void second(void) {\n"
+        "    pthread_mutex_lock(&m);\n"
+        "    shared++;\n"
+        "    pthread_mutex_unlock(&m);\n"
+        "}\n"
+    )
+
+    def test_same_line_lock_and_helper_keeps_helper_lock_free(self) -> None:
+        records = self.accesses()
+        self.assertTrue(records)
+        self.assertTrue(all(
+            "cross_function_call" not in record["limitation"]
+            for record in records
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()

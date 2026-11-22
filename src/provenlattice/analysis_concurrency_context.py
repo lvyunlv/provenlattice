@@ -353,16 +353,6 @@ def call_lock_inputs(
             )
             references_by_key.setdefault(key, []).append(row)
 
-        selected = frozenset(files) if files is not None else None
-        pending: list[str] = []
-        for key in sorted(references_by_key):
-            rows = references_by_key[key]
-            target = _resolved_call_target(rows[0]) if len(rows) == 1 else ""
-            if selected is None or key[0] in selected:
-                call_callees[key] = target or None
-                if target:
-                    pending.append(target)
-
         node_cache: dict[str, dict | None] = {}
         event_cache: dict[str, Mapping[str, Any] | None] = {}
         # owner -> (has a direct lock operation, resolved ordinary callees).
@@ -372,7 +362,8 @@ def call_lock_inputs(
         def node(symbol_id: str) -> dict | None:
             if symbol_id not in node_cache:
                 row = storage.row(
-                    "SELECT n.id, n.kind, n.file_id, n.metadata, f.path "
+                    "SELECT n.id, n.kind, n.file_id, n.qualified_name, "
+                    "n.signature, n.metadata, f.path "
                     "FROM nodes n JOIN files f ON f.file_id=n.file_id "
                     "WHERE n.id=?", (symbol_id,),
                 )
@@ -403,6 +394,84 @@ def call_lock_inputs(
                     event_cache[file_id] = candidate
             return event_cache[file_id]
 
+        file_paths = {
+            row["file_id"]: row["path"]
+            for row in storage.rows("SELECT file_id, path FROM files")
+        }
+
+        def call_leaf(name: str) -> str:
+            return str(name).rpartition(".")[2].rpartition("::")[2]
+
+        def ordinary_rows(
+            rows: list[dict], file_env: Mapping[str, Any] | None,
+            owner_symbol_id: str, line: int,
+        ) -> list[dict]:
+            """Drop reference rows already represented by a known call event.
+
+            `build_access_lockset` excludes the known vocabularies before its
+            one-reference-per-line rule; this helper must apply the same filter
+            or `pthread_mutex_lock(&m); helper();` on one line makes `helper`
+            look ambiguous. An unavailable event file keeps every row, which is
+            the fail-closed direction.
+            """
+            if file_env is None:
+                return rows
+            known = {
+                call_leaf(event.get("matched_name") or "")
+                for event in file_env.get("events", [])
+                if event.get("owner_symbol_id") == owner_symbol_id
+                and event.get("event_type") in _KNOWN_CALL_KINDS
+                and int(event.get("start_line") or 0) == line
+            }
+            if not known:
+                return rows
+            return [
+                row for row in rows
+                if call_leaf(row.get("raw_name") or "") not in known
+            ]
+
+        def definition_target(symbol_id: str) -> str:
+            """Follow a caller-local prototype to its unique definition.
+
+            A call with an explicit `void helper(void);` in the caller's file
+            resolves to that declaration even when another file defines it.
+            Rejecting the declaration as "no body" loses a provable lock-free
+            callee. Only one matching definition is accepted; zero or several
+            keep the call opaque (fail-closed).
+            """
+            symbol = node(symbol_id)
+            if symbol is None or symbol["kind"] not in {"Function", "Method"}:
+                return ""
+            if symbol["metadata"].get("definition") is True:
+                return symbol_id
+            candidates = storage.rows(
+                "SELECT id FROM nodes WHERE kind=? AND qualified_name=? "
+                "AND signature IS ? AND id != ?",
+                (symbol["kind"], symbol["qualified_name"],
+                 symbol["signature"], symbol_id),
+            )
+            definitions = [
+                row["id"] for row in candidates
+                if (node(row["id"]) or {}).get("metadata", {}).get("definition") is True
+            ]
+            return definitions[0] if len(definitions) == 1 else ""
+
+        selected = frozenset(files) if files is not None else None
+        pending: list[str] = []
+        for key in sorted(references_by_key):
+            if selected is not None and key[0] not in selected:
+                continue
+            rows = ordinary_rows(
+                references_by_key[key],
+                event_file(key[0], file_paths.get(key[0], "")),
+                key[1], key[2],
+            )
+            resolved = _resolved_call_target(rows[0]) if len(rows) == 1 else ""
+            target = definition_target(resolved) if resolved else ""
+            call_callees[key] = target or None
+            if target:
+                pending.append(target)
+
         while pending:
             symbol_id = pending.pop()
             if symbol_id in summaries:
@@ -432,6 +501,12 @@ def call_lock_inputs(
                 for event in events
                 if event.get("event_type") in _KNOWN_CALL_KINDS
             }
+            known_names_by_line: dict[int, set[str]] = {}
+            for event in events:
+                if event.get("event_type") in _KNOWN_CALL_KINDS:
+                    line = int(event.get("start_line") or 0)
+                    known_names_by_line.setdefault(line, set()).add(
+                        call_leaf(event.get("matched_name") or ""))
             calls_by_line: dict[int, int] = {}
             for event in events:
                 if (
@@ -452,7 +527,14 @@ def call_lock_inputs(
             for line in sorted(calls_by_line):
                 key = (str(symbol["file_id"]), symbol_id, line)
                 rows = references_by_key.get(key, [])
-                target = _resolved_call_target(rows[0]) if len(rows) == 1 else ""
+                known = known_names_by_line.get(line)
+                if known:
+                    rows = [
+                        row for row in rows
+                        if call_leaf(row.get("raw_name") or "") not in known
+                    ]
+                resolved = _resolved_call_target(rows[0]) if len(rows) == 1 else ""
+                target = definition_target(resolved) if resolved else ""
                 if not target:
                     unknown = True
                     break
