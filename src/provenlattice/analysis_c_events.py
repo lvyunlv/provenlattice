@@ -202,6 +202,11 @@ def _lock_designation(source: bytes, node) -> tuple[str, bool]:
     a same-named local lock in the same method -- an exactness claim the layer
     cannot back.  Keeping it empty and inexact is the honest answer until a
     declaration identity is available here.
+
+    Every other non-name expression (`*p++`, `!m`, `-m`, a call result) also
+    stays empty: the recovered root is not the object the lock call acts on.
+    The explicit subscript branch is the one non-name path that keeps its
+    root, because an element is still a member of the declared array.
     """
     node = _unwrap_parentheses(node)
     pieces: list[str] = []
@@ -236,7 +241,7 @@ def _lock_designation(source: bytes, node) -> tuple[str, bool]:
         node.type == "type_identifier" and not node.named_children
     )
     if not terminal:
-        return root, False
+        return "", False
     return ".".join([root, *pieces]), True
 
 

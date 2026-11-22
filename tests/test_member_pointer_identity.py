@@ -12,13 +12,19 @@ Pins the events-layer fact this Issue delivers:
 * a ``this->member`` designation also stays empty and inexact: the events
   layer has no field-declaration identity, so the bare member name would
   merge with a same-named local lock;
+* every other non-name expression (``*p++``, ``!m``, ``m++``) stays empty and
+  inexact too -- only the explicit subscript path keeps its root;
+* the ``events:cpp`` version advances so a cache built under the previous
+  payload semantics is re-analysed instead of reused;
 * plain root locks (``&g_lock``, ``m.try_lock()``, ``guard(m)``) are unchanged;
 * the sparse access subject is not touched: ``s.datum`` keeps its existing
   ``(subject_decl, subject_member)`` pair.
 """
 
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from provenlattice.analysis_query import query_analysis
@@ -245,6 +251,43 @@ class ThisMemberIsNotResolvedTests(MemberPointerIdentityBase):
         self.analyze()
         scenarios = build_lock_scenarios(self.events("src/this_scenario.cc"))
         self.assertEqual(scenarios["candidates"], [])
+
+
+class NonNameLockIdentityTests(MemberPointerIdentityBase):
+    def test_pointer_arithmetic_and_unary_expressions_are_unknown(self) -> None:
+        write(self.root, "src/nonname.c",
+              "#include <pthread.h>\n"
+              "pthread_mutex_t m;\n"
+              "void f(void) {\n"
+              "    pthread_mutex_lock(*p++);\n"
+              "    pthread_mutex_lock(!m);\n"
+              "    pthread_mutex_lock(-m);\n"
+              "    pthread_mutex_lock(m++);\n"
+              "}\n")
+        self.analyze()
+        locks = self.locks("src/nonname.c")
+        self.assertEqual(len(locks), 4)
+        for lock in locks:
+            self.assertEqual(lock["lock_identity"], "")
+            self.assertFalse(lock["subject_exact"])
+
+
+class EventsVersionFreshnessTests(MemberPointerIdentityBase):
+    def test_previous_events_version_is_stale(self) -> None:
+        write(self.root, "src/version.c",
+              "#include <pthread.h>\n"
+              "pthread_mutex_t m;\n"
+              "void f(void) { pthread_mutex_lock(&m); }\n")
+        self.analyze()
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE analysis_state SET feature_version=2 "
+                "WHERE feature='events:cpp'")
+            connection.commit()
+        env = query_analysis(self.root, "events", file_path="src/version.c",
+                             database=self.database)
+        self.assertEqual(env["status"], "stale")
+        self.assertIn("feature_version_changed", env.get("reason") or "")
 
 
 class AccessSubjectUnchangedTests(MemberPointerIdentityBase):
