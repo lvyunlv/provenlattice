@@ -395,22 +395,37 @@ def _threaded_dataflow(
     threaded: Mapping[str, Mapping[str, Any]],
     edges: Iterable[Mapping[str, Any]],
     lock_by_id: Mapping[str, Mapping[str, Any]],
-) -> tuple[dict[str, frozenset[str]], dict[str, list[str]]]:
-    """Must-hold lockset at every threaded point (meet = intersection).
+    opaque_calls: frozenset[str] = frozenset(),
+    raii_scopes: Iterable[tuple[str, int, int]] = (),
+) -> tuple[
+    dict[str, frozenset[str]], dict[str, list[str]],
+    dict[str, frozenset[str]], dict[str, frozenset[str]],
+]:
+    """Must-hold locksets and per-interval CALL taint at every threaded point.
 
-    Returns ``(held_in, succ)``. ``held_in[n]`` is the set of lock identities
-    provably held on **every** path reaching ``n`` (empty at the synthetic
-    entry), with ``_ENTRY`` and ``_EXIT`` materialised as pseudo nodes so a
-    loop header that is also the method entry still meets the empty entry set.
-    ``succ`` is the intra-method successor map (including the ``_EXIT`` sink)
-    reused later for the unlock-omission walk.
+    Returns ``(held_in, succ, tainted_in, tainted_out)``. ``held_in[n]`` is the
+    set of lock identities provably held on **every** path reaching ``n`` (empty
+    at the synthetic entry), with ``_ENTRY`` and ``_EXIT`` materialised as
+    pseudo nodes so a loop header that is also the method entry still meets the
+    empty entry set. ``succ`` is the intra-method successor map (including the
+    ``_EXIT`` sink) reused later for the unlock-omission walk. The two taint maps
+    expose both sides of a CALL for unordered argument-evaluation handling.
 
-    This is a greatest-fixed-point must analysis: non-entry nodes start at TOP
-    (the function's full lock-identity universe) and shrink monotonically via
-    meet = intersection, so a loop back-edge's first-round value does not
-    under-approximate a held lock to empty. Starting every node at the empty
-    set would turn the meet over ``{entry-path, back-edge}`` into ``{}`` on the
-    first pass and never recover.
+    ``tainted_in[n]`` names held-lock intervals that crossed an opaque CALL.
+    It is a may analysis (join = union), generated from separate may-held
+    acquisition depths rather than the must-held projection. It is scoped by
+    acquire/release transfer: only a release after which no acquisition of that
+    identity remains, or a provably fresh acquisition, clears old taint. An
+    access observes the input state of its flow successor, so an access in a
+    CALL's arguments is not polluted by that CALL itself.
+
+    The must analysis is a greatest-fixed-point computation: non-entry nodes
+    start at TOP (the function's full lock-identity universe) and shrink
+    monotonically via meet = intersection, so a loop back-edge's first-round
+    value does not under-approximate a held lock to empty. Starting every node
+    at the empty set would turn the meet over ``{entry-path, back-edge}`` into
+    ``{}`` on the first pass and never recover. Taint instead starts empty and
+    grows to its least fixed point.
     """
     ids = set(threaded)
     pred: dict[str, list[str]] = {n: [] for n in ids}
@@ -467,6 +482,59 @@ def _threaded_dataflow(
             return held
         return held
 
+    raii_scopes = tuple(raii_scopes)
+
+    def taint_transfer(
+        nid: str, tainted: frozenset[str], may_depth: Mapping[str, int],
+    ) -> frozenset[str]:
+        if nid in (_ENTRY, _EXIT):
+            return tainted
+        node = threaded[nid]
+        event_type = node.get("event_type")
+        fact = lock_by_id.get(nid)
+        identity = (fact or {}).get("lock_identity")
+        if event_type in (_LOCK, _UNLOCK) and identity:
+            start_byte = int(node.get("start_byte") or 0)
+            if event_type == _UNLOCK:
+                depth = may_depth.get(identity, 0)
+                # A saturated depth represents an arbitrarily deep loop nest;
+                # one release cannot prove that the outer acquisitions are gone.
+                remaining = depth_cap if depth >= depth_cap else max(0, depth - 1)
+                outer_raii = any(
+                    lock == identity and decl_start <= start_byte < scope_end
+                    for lock, decl_start, scope_end in raii_scopes
+                )
+                if remaining or outer_raii:
+                    return tainted
+                return tainted - {identity}
+            # A new acquisition is fresh only when no explicit acquisition is
+            # held on any incoming path and no outer RAII guard is active.
+            # This handles both explicit/RAII nesting and disjoint RAII scopes.
+            outer_raii = any(
+                lock == identity and decl_start < start_byte < scope_end
+                for lock, decl_start, scope_end in raii_scopes
+            )
+            if (
+                fact["subject_exact"]
+                and (fact["raii"] or fact["acquire_kind"] == _ACQUIRE_BLOCKING)
+                and not may_depth.get(identity, 0)
+                and not outer_raii
+            ):
+                return tainted - {identity}
+            return tainted
+        if nid not in opaque_calls:
+            return tainted
+        start_byte = int(node.get("start_byte") or 0)
+        active_raii = {
+            lock
+            for lock, decl_start, scope_end in raii_scopes
+            if decl_start <= start_byte < scope_end
+        }
+        may_held = {
+            identity for identity, depth in may_depth.items() if depth
+        }
+        return tainted | may_held | active_raii
+
     # Greatest fixed point: non-entry nodes start at the function's full lock
     # universe (TOP) and shrink via meet = intersection. The synthetic entry
     # holds nothing. An empty predecessor meet is vacuous TOP (universe), which
@@ -486,7 +554,7 @@ def _threaded_dataflow(
     held_in[_ENTRY] = frozenset()
     held_out[_ENTRY] = frozenset()
     order = sorted(list(ids) + [_ENTRY, _EXIT])
-    for _ in range(1000):
+    while True:
         changed = False
         for nid in order:
             if nid == _ENTRY:
@@ -502,32 +570,163 @@ def _threaded_dataflow(
                 changed = True
         if not changed:
             break
-    return held_in, succ
+
+    # CALL taint is a may property: a lock held on even one incoming path can
+    # cross that CALL on that path. Track the maximum acquisition depth per
+    # identity (join = max) so an inner release cannot erase an outer hold.
+    # Acyclic paths need at most one saturation level per LOCK event. Beyond
+    # that bound (possible only through loops), UNLOCK keeps the saturated
+    # state: conservative over-approximation is preferable to losing an outer
+    # interval. Ordinary acquisitions/releases still reset at exact depth 0.
+    # Track every potentially successful explicit acquisition in the may
+    # analysis. try/timed still stay out of the must-held projection, but their
+    # success path holds the lock across a CALL and makes a later blocking
+    # acquisition nested rather than fresh.
+    may_acquires = {
+        nid for nid in ids
+        if threaded[nid].get("event_type") == _LOCK
+        and (lock_by_id.get(nid) or {}).get("acquire_kind") in (
+            _ACQUIRE_BLOCKING, _ACQUIRE_TRY, _ACQUIRE_TIMED,
+        )
+        and not (lock_by_id.get(nid) or {}).get("raii")
+        and (lock_by_id.get(nid) or {}).get("subject_exact")
+        and (lock_by_id.get(nid) or {}).get("lock_identity")
+    }
+    depth_cap = len(may_acquires) + 1
+
+    def depth_transfer(
+        nid: str, depths: Mapping[str, int],
+    ) -> dict[str, int]:
+        if nid in (_ENTRY, _EXIT):
+            return dict(depths)
+        node = threaded[nid]
+        event_type = node.get("event_type")
+        fact = lock_by_id.get(nid)
+        identity = (fact or {}).get("lock_identity")
+        if nid in may_acquires:
+            result = dict(depths)
+            result[identity] = min(depth_cap, depths.get(identity, 0) + 1)
+            return result
+        if event_type == _UNLOCK and identity and depths.get(identity, 0):
+            result = dict(depths)
+            depth = depths[identity]
+            remaining = depth_cap if depth >= depth_cap else depth - 1
+            if remaining:
+                result[identity] = remaining
+            else:
+                result.pop(identity, None)
+            return result
+        return dict(depths)
+
+    may_depth_in: dict[str, dict[str, int]] = {
+        n: {} for n in list(ids) + [_ENTRY, _EXIT]
+    }
+    may_depth_out = dict(may_depth_in)
+    while True:
+        changed = False
+        for nid in order:
+            if nid == _ENTRY:
+                continue
+            new_in: dict[str, int] = {}
+            for predecessor in pred[nid]:
+                for identity, depth in may_depth_out[predecessor].items():
+                    new_in[identity] = max(depth, new_in.get(identity, 0))
+            new_out = depth_transfer(nid, new_in)
+            if new_out != may_depth_out[nid] or new_in != may_depth_in[nid]:
+                may_depth_out[nid] = new_out
+                may_depth_in[nid] = new_in
+                changed = True
+        if not changed:
+            break
+
+    tainted_in: dict[str, frozenset[str]] = {
+        n: frozenset() for n in list(ids) + [_ENTRY, _EXIT]
+    }
+    tainted_out = dict(tainted_in)
+    while True:
+        changed = False
+        for nid in order:
+            if nid == _ENTRY:
+                continue
+            new_in = frozenset().union(
+                *(tainted_out[p] for p in pred[nid])
+            ) if pred[nid] else frozenset()
+            new_out = taint_transfer(nid, new_in, may_depth_in[nid])
+            if new_out != tainted_out[nid] or new_in != tainted_in[nid]:
+                tainted_out[nid] = new_out
+                tainted_in[nid] = new_in
+                changed = True
+        if not changed:
+            break
+    return held_in, succ, tainted_in, tainted_out
 
 
 def _flow_successor(
-    access: Mapping[str, Any], threaded: Mapping[str, Mapping[str, Any]]
+    access: Mapping[str, Any], threaded: Mapping[str, Mapping[str, Any]],
+    *, byte_spans: bool = True,
 ) -> str | None:
     """The threaded point an access point flows into, or None for the exit.
 
     An access inside a threaded statement's span is an argument/sub-expression
     of that statement, so it "flows into" the statement itself. An access on
     its own edgeless statement flows into the next threaded point in source
-    order (or the method exit when there is none).
+    order (or the method exit when there is none). ``byte_spans=False`` is the
+    frozen legacy projection used when the additive call input is omitted.
     """
     lo = int(access.get("start_line") or 0)
     hi = int(access.get("end_line") or lo)
-    for nid in sorted(threaded):
+    if not byte_spans:
+        for nid in sorted(threaded):
+            node = threaded[nid]
+            s = int(node.get("start_line") or 0)
+            e = int(node.get("end_line") or s)
+            if s <= lo and hi <= e:
+                return nid
+        for nid in sorted(
+            threaded,
+            key=lambda key: (int(threaded[key].get("start_line") or 0), key),
+        ):
+            if int(threaded[nid].get("start_line") or 0) > hi:
+                return nid
+        return None
+    start_byte = int(access.get("start_byte") or 0)
+    end_byte = int(access.get("end_byte") or 0)
+    # Nested CALLs can all contain the same access. The innermost statement
+    # executes the access as its own argument, before any enclosing CALL and
+    # before later siblings; observing an outer CALL would run time backwards.
+    for nid in sorted(
+        threaded,
+        key=lambda key: (
+            int(threaded[key].get("end_byte") or 0)
+            - int(threaded[key].get("start_byte") or 0),
+            -int(threaded[key].get("start_byte") or 0), key,
+        ),
+    ):
         node = threaded[nid]
         s = int(node.get("start_line") or 0)
         e = int(node.get("end_line") or s)
-        if s <= lo and hi <= e:
+        if (
+            s <= lo
+            and hi <= e
+            and int(node.get("start_byte") or 0) <= start_byte
+            and end_byte <= int(node.get("end_byte") or 0)
+        ):
             return nid
     for nid in sorted(
         threaded,
-        key=lambda key: (int(threaded[key].get("start_line") or 0), key),
+        key=lambda key: (
+            int(threaded[key].get("start_line") or 0),
+            int(threaded[key].get("start_byte") or 0),
+            int(threaded[key].get("end_byte") or 0)
+            - int(threaded[key].get("start_byte") or 0), key,
+        ),
     ):
-        if int(threaded[nid].get("start_line") or 0) > hi:
+        node = threaded[nid]
+        node_line = int(node.get("start_line") or 0)
+        if node_line > hi or (
+            node_line == hi
+            and int(node.get("start_byte") or 0) > end_byte
+        ):
             return nid
     return None
 
@@ -656,6 +855,8 @@ def build_access_lockset(
     sparse_events: Iterable[Mapping[str, Any]],
     edges: Iterable[Mapping[str, Any]] = (),
     lock_facts: Iterable[Mapping[str, Any]] = (),
+    call_callees: Mapping[tuple[str, str, int], str | None] | None = None,
+    lock_free_callees: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Project a per-access held-lockset and lock identity relations (SUB-04/R4).
 
@@ -665,12 +866,22 @@ def build_access_lockset(
     two analyzers, so those facts join onto sparse declaration identities by
     event id.
 
+    ``call_callees`` optionally joins an ordinary CALL's
+    ``(file_id, owner_symbol_id, start_line)`` to one resolved symbol. A callee
+    is treated as lock-free only when it also occurs in ``lock_free_callees``;
+    missing, ambiguous, unresolved, indirect and unavailable targets remain
+    opaque. Omitting these additive inputs therefore preserves the previous
+    fail-closed call classification.
+
     The function is pure and deterministic. It never modifies the graph, never
     derives a new points-to or underlying relation, and never reports a locked
     access as "definite" -- every record is ``candidate_state: "ambiguous"``.
     """
     sparse = list(sparse_events)
     edges = list(edges)
+    legacy_call_limitations = call_callees is None
+    call_callees = call_callees or {}
+    lock_free_callees = frozenset(lock_free_callees)
     sparse_by_id = {
         event.get("event_id"): event
         for event in sparse
@@ -725,26 +936,55 @@ def build_access_lockset(
                     _access_record(owner, owner_label, ev, frozenset(), []))
             continue
 
-        held_in, succ = _threaded_dataflow(
-            threaded, edges_by_owner.get(owner, ()), lock_by_id)
         # RAII guards are lexical, not dataflow: their hold interval is read
         # straight off the lock fact rather than propagated over the CFG.
         raii_scopes, raii_identities = _raii_scopes(threaded, lock_by_id)
 
-        # Method-level, conservative limitations.
-        limitations: list[str] = []
-        known_call_bytes = {
-            int(ev.get("start_byte") or 0)
+        # Only an ordinary CALL whose unique resolved target is proven
+        # transitively lock-free is transparent. Everything else is opaque,
+        # including an omitted additive call input (the legacy caller path).
+        def call_position(ev: Mapping[str, Any]) -> tuple[int, ...]:
+            if legacy_call_limitations:
+                return (int(ev.get("start_byte") or 0),)
+            return (
+                int(ev.get("start_byte") or 0),
+                int(ev.get("end_byte") or 0),
+            )
+
+        known_call_positions = {
+            call_position(ev)
             for ev in threaded.values()
             if ev.get("event_type") in _KNOWN_CALL_KINDS
         }
-        for ev in threaded.values():
+        ordinary_calls: dict[tuple[str, str, int], list[str]] = {}
+        for eid, ev in threaded.items():
             if (
                 ev.get("event_type") == "CALL"
-                and int(ev.get("start_byte") or 0) not in known_call_bytes
+                and call_position(ev) not in known_call_positions
             ):
-                limitations.append("cross_function_call")
-                break
+                key = (
+                    str(ev.get("file_id") or ""), owner,
+                    int(ev.get("start_line") or 0),
+                )
+                ordinary_calls.setdefault(key, []).append(eid)
+        opaque_calls = frozenset() if legacy_call_limitations else frozenset({
+            eid
+            for key, event_ids in ordinary_calls.items()
+            for eid in event_ids
+            if len(event_ids) != 1
+            or not call_callees.get(key)
+            or call_callees[key] not in lock_free_callees
+        })
+        held_in, succ, tainted_in, tainted_out = _threaded_dataflow(
+            threaded, edges_by_owner.get(owner, ()), lock_by_id,
+            opaque_calls=opaque_calls, raii_scopes=raii_scopes)
+
+        # Identity limitations remain method-level: they describe the lock fact
+        # itself, not a particular CALL-crossing hold interval. With no additive
+        # call input, retain the legacy method-level CALL limitation verbatim.
+        limitations: list[str] = []
+        if legacy_call_limitations and ordinary_calls:
+            limitations.append("cross_function_call")
         for eid, ev in threaded.items():
             if ev.get("event_type") in (_LOCK, _UNLOCK):
                 fact = lock_by_id.get(eid)
@@ -756,7 +996,8 @@ def build_access_lockset(
             accesses.items(),
             key=lambda pair: (int(pair[1].get("start_byte") or 0), pair[0]),
         ):
-            successor = _flow_successor(ev, threaded)
+            successor = _flow_successor(
+                ev, threaded, byte_spans=not legacy_call_limitations)
             held = held_in[successor] if successor is not None else held_in[_EXIT]
             # A RAII guard held over this access's byte position protects it:
             # the lock is held from its declaration to its scope end (Issue #69),
@@ -769,8 +1010,43 @@ def build_access_lockset(
                 for identity, decl_start, scope_end in raii_scopes
                 if decl_start <= start_byte < scope_end
             )
+            tainted = (
+                tainted_in[successor]
+                if successor is not None else tainted_in[_EXIT]
+            )
+            # C/C++ do not sequence function arguments left-to-right. An access
+            # in a nested CALL still precedes itself and every ancestor CALL,
+            # but an opaque sibling in the same outer CALL may run first. Join
+            # those siblings' output taint regardless of their source order.
+            end_byte = int(ev.get("end_byte") or 0)
+            containing_calls = {
+                nid for nid, node in threaded.items()
+                if node.get("event_type") == "CALL"
+                and int(node.get("start_byte") or 0) <= start_byte
+                and end_byte <= int(node.get("end_byte") or 0)
+            }
+            if containing_calls:
+                outer = max(
+                    containing_calls,
+                    key=lambda nid: (
+                        int(threaded[nid].get("end_byte") or 0)
+                        - int(threaded[nid].get("start_byte") or 0), nid,
+                    ),
+                )
+                outer_start = int(threaded[outer].get("start_byte") or 0)
+                outer_end = int(threaded[outer].get("end_byte") or 0)
+                for nid in opaque_calls - containing_calls:
+                    node = threaded[nid]
+                    if (
+                        outer_start <= int(node.get("start_byte") or 0)
+                        and int(node.get("end_byte") or 0) <= outer_end
+                    ):
+                        tainted = tainted | tainted_out[nid]
+            access_limitations = list(limitations)
+            if held & tainted:
+                access_limitations.append("cross_function_call")
             access_records.append(
-                _access_record(owner, owner_label, ev, held, limitations))
+                _access_record(owner, owner_label, ev, held, access_limitations))
             for lock in sorted(held):
                 relations.append({
                     "relation": "PROTECTS",
