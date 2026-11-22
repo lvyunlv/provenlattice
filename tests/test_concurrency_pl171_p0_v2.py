@@ -6,7 +6,7 @@ fixtures, one per gate scenario from the frozen contract §5:
 1. pre-thread access in a >=2-access candidate -> trimmed, candidate kept
 2. pre-thread trim leaves <2 accesses          -> candidate dropped
 3. post-join pair, all-other-guarded           -> filtered
-4. post-join pair, other access NOT guarded    -> NOT filtered
+4. post-join pair, other access NOT guarded    -> filtered (join ordering alone, P2)
 5. exclusive same-mutex (mutex/mutex)          -> filtered
 6. read-lock vs write-lock                     -> NOT filtered
 7. malformed lock section (lost unlock)        -> NOT filtered
@@ -109,8 +109,9 @@ void starter(void) {
 }
 """
 
-# 4. PAIR-05: a post-join access with the other access unguarded -> NOT all-
-# other-guarded, so the pair is kept (the excluded cross-lifetime over-fire).
+# 4. PAIR-05: a post-join access with the other access unguarded is still ordered
+# by the bound join itself. P2 removed the extra GRD-good conjunction, so the
+# pair is filtered (the old behavior kept it as the excluded over-fire).
 POST_JOIN_UNGUARDED = r"""
 #include <pthread.h>
 int shared = 0;
@@ -323,8 +324,8 @@ class PL171P0V2DetectorTests(unittest.TestCase):
     def test_03_post_join_all_other_guarded_filtered(self):
         self.assertEqual(_races(POST_JOIN_GUARDED), [])
 
-    def test_04_post_join_unguarded_peer_kept(self):
-        self.assertEqual(len(_races(POST_JOIN_UNGUARDED)), 1)
+    def test_04_post_join_unguarded_peer_filtered(self):
+        self.assertEqual(_races(POST_JOIN_UNGUARDED), [])
 
     def test_05_mutex_mutex_same_lock_filtered(self):
         self.assertEqual(_races(MUTEX_MUTEX), [])
