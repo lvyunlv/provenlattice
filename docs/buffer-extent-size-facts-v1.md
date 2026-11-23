@@ -426,10 +426,12 @@ The metadata structure change advances:
 - `sparse_cfg:cpp`: **5 -> 6** (`cpp-sparse_cfg-v6`);
 - `sparse_dfg:cpp`: **3 -> 4** (`cpp-sparse_dfg-v4`).
 
-`events:cpp` remains version 2 because the event vocabulary/identity producer is
-unchanged. SCFG freshness rejects the old analyzer version/source hash. SDFG
-also records the SCFG dependency contract, so `dependency_staleness` rejects a
-cache built under `cpp-sparse_cfg-v5` even if its own source hash is unchanged.
+`events:cpp` remained version 2 at the time of this change because the event
+vocabulary/identity producer was unchanged; it was later advanced to 3 by
+issue-pilot #90 (member-level lock designations). SCFG freshness rejects the
+old analyzer version/source hash. SDFG also records the SCFG dependency
+contract, so `dependency_staleness` rejects a cache built under
+`cpp-sparse_cfg-v5` even if its own source hash is unchanged.
 
 No defect query or defect category consumes these annotations in V1. In
 particular, an extent of 4 plus an index of 4 is only a pair of facts; it does not
