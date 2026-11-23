@@ -585,6 +585,11 @@ class _AliasEntry:
     # "" when the name is not atomic; otherwise "object" (the name itself is
     # atomic), "pointee" (a pointer to an atomic object), or "array".
     kind: str
+    # Macro entries carry their replacement text so the kind is resolved at
+    # the use site, not at definition time. ``None`` with ``is_macro`` means
+    # the macro was #undef'ed.
+    macro_text: str | None = None
+    is_macro: bool = False
 
 
 class AtomicTypeIndex:
@@ -592,22 +597,48 @@ class AtomicTypeIndex:
 
     A typedef's name is visible from its declaration to the end of its
     enclosing block, and an inner declaration shadows an outer one. Macros
-    follow preprocessor order, including `#undef` and redefinition. A flat
-    name set would mark `typedef int T;` inside a function as atomic because
-    an outer `typedef _Atomic int T;` exists -- a fail-open that hides real
-    races.
+    follow preprocessor order, including `#undef` and redefinition; their
+    replacement text is expanded at the use site. Macro and typedef names are
+    separate namespaces: an `#undef` removes the macro, it does not hide an
+    equally named typedef. A flat name set would mark `typedef int T;` inside
+    a function as atomic because an outer `typedef _Atomic int T;` exists --
+    a fail-open that hides real races.
     """
 
-    def __init__(self, entries: list[_AliasEntry]) -> None:
+    def __init__(
+        self, entries: list[_AliasEntry], macros: list[_AliasEntry] | None = None,
+    ) -> None:
         self.entries = tuple(entries)
+        self.macros = tuple(macros or ())
 
     @property
     def aliases(self) -> frozenset[str]:
         return frozenset(entry.name for entry in self.entries if entry.kind)
 
+    def _macro_at(self, name: str, byte: int) -> _AliasEntry | None:
+        visible = [
+            entry for entry in self.macros
+            if entry.name == name and entry.start_byte <= byte
+        ]
+        if not visible:
+            return None
+        return max(visible, key=lambda entry: entry.start_byte)
+
     def kind_of(self, name: str, byte: int) -> str:
-        if not name:
+        return self._kind_of(name, byte, ())
+
+    def _kind_of(self, name: str, byte: int, seen: tuple[str, ...]) -> str:
+        if not name or name in seen:
             return ""
+        macro = self._macro_at(name, byte)
+        if macro is not None:
+            if macro.macro_text is None:
+                # `#undef`: the macro is gone, but a typedef of the same name
+                # remains visible.
+                pass
+            else:
+                return _macro_type_kind(macro.macro_text, self, byte,
+                                        seen + (name,))
         visible = [
             entry for entry in self.entries
             if entry.name == name
@@ -622,46 +653,168 @@ class AtomicTypeIndex:
         return bool(self.kind_of(name, byte))
 
 
-_MACRO_DIRECTIVE = re.compile(
-    r"^[ \t]*#[ \t]*(define|undef)[ \t]+([A-Za-z_][A-Za-z_0-9]*)([^\n]*)",
-    re.MULTILINE,
-)
+_ATOMIC_TOKEN = re.compile(r"(?<![A-Za-z0-9_])_Atomic(?![A-Za-z0-9_])")
+_MACRO_NAME = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+_DIRECTIVE = re.compile(r"^[ \t]*#[ \t]*([A-Za-z_]+)(.*)$", re.DOTALL)
 
 
-def _macro_type_kind(value: str, types: "AtomicTypeIndex", byte: int) -> str:
+def _active_text(source: bytes) -> str:
+    """Source text with comments, string bodies and `#if 0` branches blanked.
+
+    Length and newlines are preserved so offsets recovered from this text still
+    address the original source. A full preprocessor is out of scope; literal
+    `#if 0` (and its `#else` arm) is the only conditional form treated as
+    inactive, and everything else is left for the normal token/AST paths.
+    """
+    text = source.decode("utf-8", "replace")
+    chars = list(text)
+    n = len(text)
+
+    def blank(start: int, end: int) -> None:
+        for index in range(start, min(end, n)):
+            if chars[index] not in "\r\n":
+                chars[index] = " "
+
+    index = 0
+    quote = ""
+    while index < n:
+        char = text[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+            else:
+                chars[index] = " "
+            index += 1
+            continue
+        if char in {'"', "'"}:
+            quote = char
+            index += 1
+            continue
+        if text.startswith("/*", index):
+            close = text.find("*/", index + 2)
+            end = n if close < 0 else close + 2
+            blank(index, end)
+            index = end
+            continue
+        if text.startswith("//", index):
+            close = text.find("\n", index + 2)
+            end = n if close < 0 else close
+            blank(index, end)
+            index = end
+            continue
+        index += 1
+
+    # Blank literal `#if 0` branches. The `#else` arm, when present, is active.
+    lines = "".join(chars).splitlines(keepends=True)
+    result: list[str] = []
+    offset = 0
+    skip_depth = 0
+    for line in lines:
+        stripped = line.lstrip()
+        directive = ""
+        rest = ""
+        if stripped.startswith("#"):
+            match = _DIRECTIVE.match(stripped)
+            if match is not None:
+                directive = match.group(1).lower()
+                rest = match.group(2).strip()
+        blank_line = False
+        if skip_depth == 0:
+            if directive == "if" and rest == "0":
+                skip_depth = 1
+                blank_line = True
+        else:
+            if directive in {"if", "ifdef", "ifndef"}:
+                skip_depth += 1
+                blank_line = True
+            elif directive == "else" and skip_depth == 1:
+                skip_depth = 0
+                blank_line = True
+            elif directive == "endif":
+                skip_depth = max(0, skip_depth - 1)
+                blank_line = True
+            else:
+                blank_line = True
+        if blank_line:
+            result.append("".join(
+                char if char in "\r\n" else " " for char in line))
+        else:
+            result.append(line)
+        offset += len(line)
+    return "".join(result)
+
+
+def _macro_type_kind(
+    value: str, types: "AtomicTypeIndex", byte: int,
+    seen: tuple[str, ...] = (),
+) -> str:
     """The kind a macro replacement text denotes, or "".
 
     `_Atomic int` and `_Atomic(int)` declare an atomic object; `_Atomic int *`
     is a pointer to an atomic object, while `_Atomic(int *)` makes the pointer
-    object itself atomic.
+    object itself atomic. A macro naming another macro/typedef is resolved at
+    the use site, not when the `#define` was read.
     """
     stripped = value.strip()
-    if ATOMIC_QUALIFIER in stripped:
+    if not stripped:
+        return ""
+    if _ATOMIC_TOKEN.search(stripped):
         without_group = re.sub(r"_Atomic\s*\([^)]*\)", " ", stripped)
-        without_qualifier = without_group.replace(ATOMIC_QUALIFIER, " ")
+        without_qualifier = _ATOMIC_TOKEN.sub(" ", without_group)
         return "pointee" if "*" in without_qualifier else "object"
-    return types.kind_of(stripped, byte)
+    if _MACRO_NAME.fullmatch(stripped):
+        return types._kind_of(stripped, byte, seen)
+    return ""
 
 
-def _collect_atomic_macro_entries(source: bytes) -> list[_AliasEntry]:
+def _collect_atomic_macro_entries(source: bytes) -> tuple[list[_AliasEntry], list[_AliasEntry]]:
     """Object-like macro entries in preprocessor order.
 
-    Position matters: a declaration before a later `#define` or `#undef` must
-    keep the meaning it had at that point, so every directive is an entry in
-    the same scoped index the typedefs use.
+    Comments, strings and literal `#if 0` branches are blanked before scanning.
+    Function-like macros are not type aliases and are skipped. Backslash
+    continuations are joined into one logical directive; the entry keeps the
+    first physical line's offset. The replacement text is stored verbatim and
+    resolved at the use site, so `#undef`/redefinition order is honoured.
     """
-    text = source.decode("utf-8", "replace")
-    events: list[tuple[str, int, str | None]] = []
-    for match in _MACRO_DIRECTIVE.finditer(text):
-        directive, name, rest = match.group(1), match.group(2), match.group(3)
-        events.append((name, match.start(), None if directive == "undef" else rest))
-    entries: list[_AliasEntry] = []
-    for name, start, value in events:
-        kind = ""
-        if value is not None:
-            kind = _macro_type_kind(value, AtomicTypeIndex(entries), start)
-        entries.append(_AliasEntry(name, start, 0, 1 << 62, kind))
-    return entries
+    text = _active_text(source)
+    lines = text.splitlines(keepends=True)
+    macros: list[_AliasEntry] = []
+    offset = 0
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        start = offset
+        offset += len(line)
+        index += 1
+        logical = line
+        while logical.rstrip("\r\n").endswith("\\") and index < len(lines):
+            logical = logical.rstrip("\r\n")[:-1] + " " + lines[index]
+            offset += len(lines[index])
+            index += 1
+        match = re.match(
+            r"^[ \t]*#[ \t]*(define|undef)[ \t]+([A-Za-z_][A-Za-z_0-9]*)",
+            logical,
+        )
+        if match is None:
+            continue
+        directive, name = match.group(1), match.group(2)
+        rest = logical[match.end():]
+        if directive == "define":
+            if rest.startswith("("):
+                # Function-like macro: `T` without an argument list never
+                # expands, so it cannot name a type alias.
+                continue
+            macros.append(_AliasEntry(
+                name, start, 0, 1 << 62, "",
+                macro_text=rest.strip(), is_macro=True))
+        else:
+            macros.append(_AliasEntry(
+                name, start, 0, 1 << 62, "",
+                macro_text=None, is_macro=True))
+    return [], macros
 
 
 def _type_children_kind(
@@ -761,14 +914,14 @@ _RECOVERED_TYPEDEF = re.compile(
 
 def _build_atomic_type_index(root: Any, source: bytes) -> AtomicTypeIndex:
     """Every typedef/macro entry with its scope and kind."""
-    entries: list[_AliasEntry] = _collect_atomic_macro_entries(source)
+    entries, macros = _collect_atomic_macro_entries(source)
     for node in _walk_nodes(root):
         if node.type != "type_definition":
             continue
         pairs = _type_definition_entries(node, source)
         if not pairs:
             continue
-        types = AtomicTypeIndex(entries)
+        types = AtomicTypeIndex(entries, macros)
         type_kind = _type_children_kind(
             _typedef_underlying_children(node, source), source, types)
         scope = _enclosing_scope(node)
@@ -781,12 +934,14 @@ def _build_atomic_type_index(root: Any, source: bytes) -> AtomicTypeIndex:
                 name, node.start_byte, scope_start, scope_end, kind))
     # `typedef _Atomic(type) AI;` arrives as a grammar ERROR, so the recovered
     # spelling is read from the source with the same scope rules and kind
-    # combination as the AST typedefs.
-    text = source.decode("utf-8", "replace")
+    # combination as the AST typedefs. Comments, strings and `#if 0` branches
+    # are blanked by `_active_text`, so they cannot fabricate a typedef.
+    text = _active_text(source)
     for match in _RECOVERED_TYPEDEF.finditer(text):
         for part, offset in _top_level_parts(match.group(2)):
             part = _strip_initializer(part)
-            base = match.start(2) + offset
+            part, paren_shift = _strip_wrapping_parens(part)
+            base = match.start(2) + offset + paren_shift
             pointer = _RECOVERED_POINTER.match(part)
             if pointer is not None:
                 stars, name = pointer.group(1), pointer.group(2)
@@ -808,7 +963,7 @@ def _build_atomic_type_index(root: Any, source: bytes) -> AtomicTypeIndex:
             scope_start, scope_end = _scope_at(root, name_start)
             entries.append(_AliasEntry(
                 name, name_start, scope_start, scope_end, kind))
-    return AtomicTypeIndex(entries)
+    return AtomicTypeIndex(entries, macros)
 
 
 def _declaration_type_kind(node: Any, source: bytes, types: AtomicTypeIndex) -> str:
@@ -957,10 +1112,40 @@ def _recovered_declarators(node: Any, source: bytes) -> tuple[list[tuple[Any, st
 
 
 _RECOVERED_DECLARATION = re.compile(
-    r"_Atomic\s*\([^)]*\)\s*([^;{]+);")
+    r"_Atomic\s*\([^)]*\)\s*([^;]+);")
 _RECOVERED_POINTER = re.compile(r"^\s*(\*+)\s*([A-Za-z_][A-Za-z_0-9]*)")
 _RECOVERED_ARRAY = re.compile(r"^\s*([A-Za-z_][A-Za-z_0-9]*)\s*\[")
 _RECOVERED_OBJECT = re.compile(r"^\s*([A-Za-z_][A-Za-z_0-9]*)")
+
+
+def _strip_wrapping_parens(text: str) -> tuple[str, int]:
+    """Strip balanced parentheses wrapping the whole declarator.
+
+    Returns the inner text and the number of characters removed before it, so
+    offsets into the original source remain exact (`(T)` -> `T`, 1;
+    ` (*P)` -> `*P`, 2).
+    """
+    shift = 0
+    current = text
+    while True:
+        leading = len(current) - len(current.lstrip())
+        stripped = current.lstrip()
+        if not stripped.startswith("("):
+            return current, shift
+        depth = 0
+        close = -1
+        for index, character in enumerate(stripped):
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    close = index
+                    break
+        if close < 0 or stripped[close + 1:].strip():
+            return current, shift
+        shift += leading + 1
+        current = stripped[1:close]
 
 
 def _top_level_parts(text: str) -> list[tuple[str, int]]:
@@ -1005,7 +1190,7 @@ def _source_recovered_declarations(
     """
     recovered: list[AtomicDeclaration] = []
     limitations: list[str] = []
-    text = source.decode("utf-8", "replace")
+    text = _active_text(source)
     for match in _RECOVERED_DECLARATION.finditer(text):
         prefix = text[max(0, match.start() - 32):match.start()]
         if re.search(r"typedef\s*$", prefix):
@@ -1013,7 +1198,8 @@ def _source_recovered_declarations(
         owner_start, owner_end = _owner_span(owners, match.start(), match.end())
         for part, offset in _top_level_parts(match.group(1)):
             part = _strip_initializer(part)
-            base = match.start(1) + offset
+            part, paren_shift = _strip_wrapping_parens(part)
+            base = match.start(1) + offset + paren_shift
             pointer = _RECOVERED_POINTER.match(part)
             if pointer is not None:
                 stars, name = pointer.group(1), pointer.group(2)
@@ -1148,6 +1334,10 @@ def _collect_atomic_regions(
     """
     calls: list[tuple[int, int, str, int, tuple[int | None, int | None]]] = []
     limitations: list[str] = []
+    # Any non-direct begin/end inside a candidate pair makes that pair's
+    # extent path-dependent. Keep their positions so the pair can be revoked
+    # after the direct-only pairing pass.
+    invalidating: list[tuple[tuple[int | None, int | None], int]] = []
     for node in _walk_nodes(root):
         if node.type != "call_expression":
             continue
@@ -1158,10 +1348,11 @@ def _collect_atomic_regions(
         if name not in {VERIFIER_ATOMIC_BEGIN, VERIFIER_ATOMIC_END}:
             continue
         compound = _enclosing_compound(node)
+        owner = _owner_span(owners, node.start_byte, node.end_byte)
         if not _direct_statement_of(node, compound):
             limitations.append(f"atomic_block_conditional@{node.start_byte}")
+            invalidating.append((owner, node.start_byte))
             continue
-        owner = _owner_span(owners, node.start_byte, node.end_byte)
         calls.append((
             node.start_byte, node.end_byte, name,
             compound.start_byte if compound is not None else -1,
@@ -1173,7 +1364,7 @@ def _collect_atomic_regions(
     for start, end, name, compound, owner in calls:
         groups.setdefault(owner, []).append((start, end, name, compound))
 
-    regions: list[tuple[int, int]] = []
+    regions: list[tuple[tuple[int | None, int | None], int, int, int]] = []
     for owner, ordered in groups.items():
         stack: list[tuple[int, int, int, bool]] = []  # (start, end, compound, valid)
         for start, end, name, compound in ordered:
@@ -1197,10 +1388,21 @@ def _collect_atomic_regions(
             if begin_end > start:
                 limitations.append(f"atomic_block_inverted@{begin_start}")
                 continue
-            regions.append((begin_end, start))
+            regions.append((owner, begin_start, begin_end, start))
         for begin_start, _begin_end, _compound, _valid in stack:
             limitations.append(f"atomic_block_unpaired_begin@{begin_start}")
-    return tuple(sorted(regions)), tuple(limitations)
+
+    strong: list[tuple[int, int]] = []
+    for owner, begin_start, begin_end, end_start in regions:
+        if any(
+            invalid_owner == owner and begin_start <= byte <= end_start
+            for invalid_owner, byte in invalidating
+        ):
+            # A conditional call inside the span means at least one path may
+            # leave the region early; keep the whole pair unknown.
+            continue
+        strong.append((begin_end, end_start))
+    return tuple(sorted(strong)), tuple(limitations)
 
 
 def _collect_atomic_members(

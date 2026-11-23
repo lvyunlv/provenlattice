@@ -32,6 +32,7 @@ same way the I1-A events analyzer was:
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 
@@ -206,7 +207,7 @@ def _is_addressed_expression(node, source: bytes) -> bool:
     return (
         parent is not None
         and parent.type == "pointer_expression"
-        and parent.child_by_field_name("argument") is node
+        and _same_node(parent.child_by_field_name("argument"), node)
         and source[parent.start_byte:parent.start_byte + 1] == b"&"
     )
 
@@ -322,9 +323,26 @@ def _inside_spans(
     spans: tuple[tuple[int, int], ...],
     evaluated: tuple[tuple[int, int], ...] = (),
 ) -> bool:
-    if any(start <= byte < end for start, end in evaluated):
+    """Whether the innermost enclosing span is unevaluated.
+
+    A VLA extent inside `sizeof` is evaluated, while a `_Generic` controlling
+    expression inside that extent is still unevaluated. The narrowest enclosing
+    span decides; looking for any evaluated span first would hide the nested
+    unevaluated context.
+    """
+    candidates = [
+        (end - start, True)
+        for start, end in spans
+        if start <= byte < end
+    ]
+    candidates.extend(
+        (end - start, False)
+        for start, end in evaluated
+        if start <= byte < end
+    )
+    if not candidates:
         return False
-    return any(start <= byte < end for start, end in spans)
+    return min(candidates, key=lambda item: item[0])[1]
 
 
 def _root_is_dereferenced(node, source: bytes) -> bool:
@@ -404,6 +422,40 @@ def _access_expression(node, source: bytes):
     return current
 
 
+def _node_at_span(root, start: int, end: int):
+    """The named node with exactly this span, or None."""
+    for node in _walk_tree(root):
+        if node.start_byte == start and node.end_byte == end:
+            return node
+    return None
+
+
+def _is_element_access(node, source: bytes) -> bool:
+    """Whether the expression reads/writes an array element or pointee.
+
+    A bare array identifier (`p = a`, `sink(a)`, `a + 1`) converts to a pointer
+    and touches no element; only a subscript or `*` access does.
+    """
+    if node is None:
+        return False
+    if node.type == "subscript_expression":
+        return True
+    return (
+        node.type == "pointer_expression"
+        and source[node.start_byte:node.start_byte + 1] == b"*"
+    )
+
+
+_NESTED_MEMBER = re.compile(
+    r"[A-Za-z_][A-Za-z_0-9]*\s*(?:\.|->)\s*[A-Za-z_][A-Za-z_0-9]*"
+    r"\s*(?:\.|->)\s*[A-Za-z_][A-Za-z_0-9]*"
+)
+
+
+def _nested_member_expression(expression: str) -> bool:
+    return bool(_NESTED_MEMBER.search(expression or ""))
+
+
 def _subject_declaration(declarations, byte: int, subject: str, annotations):
     if declarations is None or not subject:
         return None
@@ -442,7 +494,7 @@ def _atomic_source_for_annotations(atomic, declarations, owners, byte: int, anno
     dereferenced = _is_dereference_expression(expression)
     if _atomic_member(atomic, declarations, byte, declaration, member):
         return "type_qualifier"
-    if atomic.is_atomic_array(declaration):
+    if atomic.is_atomic_array(declaration) and dereferenced:
         return "type_qualifier"
     if atomic.is_atomic_declaration(declaration) and not dereferenced:
         return "type_qualifier"
@@ -462,7 +514,10 @@ def _atomic_source_for_annotations(atomic, declarations, owners, byte: int, anno
             if recovered.kind == "pointee":
                 if dereferenced:
                     return "type_specifier"
-            elif recovered.kind == "array" or not dereferenced:
+            elif recovered.kind == "array":
+                if dereferenced:
+                    return "type_specifier"
+            elif not dereferenced:
                 return "type_specifier"
     return ""
 
@@ -510,7 +565,12 @@ def _collect_atomic_candidates(
     covered: set[tuple] = set()
     covered_spans: set[tuple] = set()
     limitations: list[str] = []
-    has_atomic_objects = bool(atomic.declaration_keys or atomic.recovered)
+    has_atomic_objects = bool(
+        atomic.declaration_keys
+        or atomic.recovered
+        or atomic.array_keys
+        or atomic.pointee_keys
+    )
     unevaluated, evaluated = _unevaluated_spans(root)
 
     def append(owner, start_byte: int, end_byte: int, expression: str, annotations: dict) -> None:
@@ -539,12 +599,23 @@ def _collect_atomic_candidates(
             continue
         if _inside_spans(point.start_byte, unevaluated, evaluated):
             continue
+        point_node = _node_at_span(root, point.start_byte, point.end_byte)
+        if _is_addressed_expression(point_node, source):
+            # `&a[0]` computes an address; it neither reads nor writes the
+            # element, even inside an atomic region.
+            continue
         annotations = cfg.annotations.get(point.key()) or {}
         if not annotations.get("subject"):
             continue
         atomic_source = _atomic_source_for_annotations(
             atomic, declarations, owners, point.start_byte, annotations)
         if not atomic_source:
+            if (
+                has_atomic_objects
+                and _nested_member_expression(annotations.get("expression", ""))
+            ):
+                limitations.append(
+                    f"atomic_member_chain_unsupported@{point.start_byte}")
             continue
         owner = owners.owner_of(point.start_byte, point.end_byte)
         if owner is None:
@@ -603,7 +674,9 @@ def _collect_atomic_candidates(
                     atomic_source = "type_qualifier"
                 elif inside_region:
                     atomic_source = "atomic_block"
-            elif atomic.is_atomic_array(declaration):
+            elif atomic.is_atomic_array(declaration) and _is_element_access(
+                expression_node, source
+            ):
                 atomic_source = "type_qualifier"
             elif atomic.is_atomic_declaration(declaration) and not dereferenced:
                 atomic_source = "type_qualifier"
@@ -622,13 +695,19 @@ def _collect_atomic_candidates(
                 if recovered.kind == "pointee":
                     if dereferenced:
                         atomic_source = "type_specifier"
-                elif recovered.kind == "array" or not dereferenced:
+                elif recovered.kind == "array":
+                    if _is_element_access(expression_node, source):
+                        atomic_source = "type_specifier"
+                elif not dereferenced:
                     atomic_source = "type_specifier"
                 if not atomic_source and inside_region:
                     atomic_source = "atomic_block"
             elif inside_region:
                 atomic_source = "atomic_block"
         if not atomic_source:
+            if has_atomic_objects and _nested_member_expression(expression_text):
+                limitations.append(
+                    f"atomic_member_chain_unsupported@{expression_node.start_byte}")
             if (
                 has_atomic_objects
                 and recovered is None

@@ -153,6 +153,24 @@ void start(void) {
 }
 """
 
+CONDITIONAL_END = r"""
+#include <pthread.h>
+int g_value = 0;
+void *bump(void *arg) {
+    __VERIFIER_atomic_begin();
+    if (arg) __VERIFIER_atomic_end();
+    g_value++;
+    __VERIFIER_atomic_end();
+    return NULL;
+}
+void start(void) {
+    pthread_t t;
+    pthread_create(&t, NULL, bump, NULL);
+    g_value = 2;
+    pthread_join(t, NULL);
+}
+"""
+
 TYPEDEF_ALIAS = r"""
 #include <pthread.h>
 typedef _Atomic int atomic_int;
@@ -253,6 +271,127 @@ MACRO_TYPE_SPECIFIER_ALIAS = r"""
 #define AI _Atomic(int)
 AI g;
 void touch(void) { g = 1; }
+"""
+
+COMMENT_FAKE_TYPEDEF = r"""
+typedef int T;
+/* typedef _Atomic(int) T; */
+T g;
+void touch(void) { g = 1; }
+"""
+
+INACTIVE_IF0_TYPEDEF = r"""
+#define T int
+#if 0
+#define T _Atomic int
+#endif
+T g;
+void touch(void) { g = 1; }
+"""
+
+STRING_FAKE_TYPEDEF = r"""
+typedef int T;
+const char *text = "typedef _Atomic(int) T;";
+T g;
+void touch(void) { g = 1; }
+"""
+
+FUNCTION_LIKE_MACRO = r"""
+typedef int T;
+#define T(x) _Atomic int
+T g;
+void touch(void) { g = 1; }
+"""
+
+MACRO_REDEFINED_AFTER_USE = r"""
+#define U _Atomic int
+#define T U
+#undef U
+#define U int
+T g;
+void touch(void) { g = 1; }
+"""
+
+SUFFIXED_IDENTIFIER = r"""
+typedef int MY_Atomic;
+#define T MY_Atomic
+T g;
+void touch(void) { g = 1; }
+"""
+
+CONTINUED_POINTER_MACRO = r"""
+#define P _Atomic int \
+    *
+P p;
+int *q;
+void touch(void) {
+    p = q;
+    *p = 1;
+}
+"""
+
+UNDEF_DOES_NOT_HIDE_TYPEDEF = r"""
+typedef _Atomic int T;
+#undef T
+T g;
+void touch(void) { g = 1; }
+"""
+
+ARRAY_DECAY = r"""
+_Atomic int a[2];
+int *p;
+void touch(void) { p = a; }
+"""
+
+ADDRESS_OF_ELEMENT = r"""
+int a[2];
+void touch(void) {
+    __VERIFIER_atomic_begin();
+    &a[0];
+    __VERIFIER_atomic_end();
+}
+"""
+
+GENERIC_IN_VLA_EXTENT = r"""
+int n;
+void touch(void) {
+    __VERIFIER_atomic_begin();
+    sizeof(int[_Generic(n, int: 1, default: 2)]);
+    __VERIFIER_atomic_end();
+}
+"""
+
+NESTED_ATOMIC_MEMBER = r"""
+struct Inner { _Atomic int x; };
+struct Outer { struct Inner inner; };
+struct Outer o;
+void touch(void) { o.inner.x = 1; }
+"""
+
+BRACED_RECOVERED_ARRAY = r"""
+_Atomic(int) a[2] = {0};
+void touch(void) { a[0] = 1; }
+"""
+
+PAREN_RECOVERED_TYPEDEF = r"""
+typedef _Atomic(int) (T);
+T g;
+void touch(void) { g = 1; }
+"""
+
+PAREN_RECOVERED_POINTER_TYPEDEF = r"""
+typedef _Atomic(int) (*P);
+P p;
+int *q;
+void touch(void) {
+    p = q;
+    *p = 1;
+}
+"""
+
+UNKNOWN_ALIAS_TO_ATOMIC_ARRAY = r"""
+_Atomic int a[2];
+void touch(void *q) { *(int *)q = 1; }
 """
 
 TYPEDEF_TYPE_SPECIFIER_ALIAS = r"""
@@ -520,6 +659,13 @@ class AtomicEventTests(unittest.TestCase):
             limit.startswith("atomic_block_conditional")
             for limit in state.get("atomic_limitations", ())))
 
+    def test_conditional_end_invalidates_the_outer_pair(self) -> None:
+        nodes, _env, state = _materialize(CONDITIONAL_END)
+        self.assertEqual(nodes, [])
+        self.assertTrue(any(
+            limit.startswith("atomic_block_conditional")
+            for limit in state.get("atomic_limitations", ())))
+
     def test_sizeof_operand_is_not_an_access(self) -> None:
         nodes, _env, _state = _materialize(SIZEOF_OPERAND)
         self.assertEqual(nodes, [])
@@ -535,6 +681,82 @@ class AtomicEventTests(unittest.TestCase):
     def test_macro_alias_of_type_specifier(self) -> None:
         nodes, _env, _state = _materialize(MACRO_TYPE_SPECIFIER_ALIAS)
         self.assertEqual(_subjects(nodes), {"g"})
+
+    def test_comment_is_not_a_typedef(self) -> None:
+        nodes, _env, _state = _materialize(COMMENT_FAKE_TYPEDEF)
+        self.assertEqual(nodes, [])
+
+    def test_inactive_if0_is_not_a_macro(self) -> None:
+        nodes, _env, _state = _materialize(INACTIVE_IF0_TYPEDEF)
+        self.assertEqual(nodes, [])
+
+    def test_string_literal_is_not_a_typedef(self) -> None:
+        nodes, _env, _state = _materialize(STRING_FAKE_TYPEDEF)
+        self.assertEqual(nodes, [])
+
+    def test_function_like_macro_is_not_an_object_alias(self) -> None:
+        nodes, _env, _state = _materialize(FUNCTION_LIKE_MACRO)
+        self.assertEqual(nodes, [])
+
+    def test_macro_is_resolved_at_the_use_site(self) -> None:
+        nodes, _env, _state = _materialize(MACRO_REDEFINED_AFTER_USE)
+        self.assertEqual(nodes, [])
+
+    def test_atomic_substring_in_identifier_is_not_a_qualifier(self) -> None:
+        nodes, _env, _state = _materialize(SUFFIXED_IDENTIFIER)
+        self.assertEqual(nodes, [])
+
+    def test_continued_pointer_macro_keeps_pointee_kind(self) -> None:
+        nodes, _env, _state = _materialize(CONTINUED_POINTER_MACRO)
+        self.assertTrue(nodes)
+        self.assertEqual(
+            {_annotations(node).get("expression", "") for node in nodes},
+            {"*p"})
+
+    def test_undef_does_not_hide_typedef(self) -> None:
+        nodes, _env, _state = _materialize(UNDEF_DOES_NOT_HIDE_TYPEDEF)
+        self.assertEqual(_subjects(nodes), {"g"})
+
+    def test_array_decay_is_not_an_element_access(self) -> None:
+        nodes, _env, _state = _materialize(ARRAY_DECAY)
+        self.assertEqual(nodes, [])
+
+    def test_address_of_element_is_not_an_access(self) -> None:
+        nodes, _env, _state = _materialize(ADDRESS_OF_ELEMENT)
+        self.assertEqual(nodes, [])
+
+    def test_generic_control_inside_vla_extent_is_unevaluated(self) -> None:
+        nodes, _env, _state = _materialize(GENERIC_IN_VLA_EXTENT)
+        self.assertEqual(nodes, [])
+
+    def test_nested_member_is_an_explicit_limitation(self) -> None:
+        nodes, _env, state = _materialize(NESTED_ATOMIC_MEMBER)
+        self.assertEqual(nodes, [])
+        self.assertTrue(any(
+            limit.startswith("atomic_member_chain_unsupported")
+            for limit in state.get("atomic_limitations", ())))
+
+    def test_braced_initializer_does_not_hide_recovered_array(self) -> None:
+        nodes, _env, _state = _materialize(BRACED_RECOVERED_ARRAY)
+        self.assertEqual(_subjects(nodes), {"a"})
+
+    def test_parenthesized_recovered_typedef(self) -> None:
+        nodes, _env, _state = _materialize(PAREN_RECOVERED_TYPEDEF)
+        self.assertEqual(_subjects(nodes), {"g"})
+
+    def test_parenthesized_recovered_pointer_typedef(self) -> None:
+        nodes, _env, _state = _materialize(PAREN_RECOVERED_POINTER_TYPEDEF)
+        self.assertTrue(nodes)
+        self.assertEqual(
+            {_annotations(node).get("expression", "") for node in nodes},
+            {"*p"})
+
+    def test_unknown_alias_to_atomic_array_is_a_limitation(self) -> None:
+        nodes, _env, state = _materialize(UNKNOWN_ALIAS_TO_ATOMIC_ARRAY)
+        self.assertEqual(nodes, [])
+        self.assertTrue(any(
+            limit.startswith("atomic_alias_unresolved")
+            for limit in state.get("atomic_limitations", ())))
 
     def test_typedef_of_type_specifier(self) -> None:
         nodes, _env, _state = _materialize(TYPEDEF_TYPE_SPECIFIER_ALIAS)
