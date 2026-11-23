@@ -353,6 +353,8 @@ def build_lock_scenarios(events: Iterable[Mapping[str, Any]]) -> dict:
 
 _READ = "READ"
 _WRITE = "WRITE"
+_DECLARATION = "DECLARATION"
+_LOCAL_ACCESS_KEY = "local_access_v1"
 _ACCESS_EVENT_TYPES = frozenset({_READ, _WRITE})
 
 # A CALL that is attributable to one of these sibling vocabulary events is a
@@ -916,13 +918,24 @@ def build_access_lockset(
 
     for owner in sorted(nodes_by_owner):
         node_map = nodes_by_owner[owner]
+        # #84's declaration/access facts are a separate, annotation-joined
+        # contract. DECLARATION is edgeless just like READ/WRITE, and ordinary
+        # local accesses deliberately have no legacy subject channel. Neither
+        # may become a lockset control point or a shared-storage access record;
+        # pre-existing local bare-copy/null-write events retain `subject` and
+        # therefore keep their historical behavior.
         threaded = {
             eid: ev for eid, ev in node_map.items()
             if ev.get("event_type") not in _ACCESS_EVENT_TYPES
+            and ev.get("event_type") != _DECLARATION
         }
         accesses = {
             eid: ev for eid, ev in node_map.items()
             if ev.get("event_type") in _ACCESS_EVENT_TYPES
+            and not (
+                _LOCAL_ACCESS_KEY in (ev.get("annotations") or {})
+                and "subject" not in (ev.get("annotations") or {})
+            )
         }
         owner_label = owner_labels.get(owner, owner)
         if not threaded:

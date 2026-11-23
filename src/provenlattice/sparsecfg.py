@@ -39,6 +39,13 @@ from .semantics.events import ACCESS_EVENTS
 
 CONTROL_REACHES = "CONTROL_REACHES"
 
+# Additive V1 facts for local definite-assignment consumers.  They travel in
+# the existing annotation map; no storage relation or schema is introduced.
+DECLARATION = "DECLARATION"
+LOCAL_DECLARATION_KEY = "local_declaration_v1"
+LOCAL_ACCESS_KEY = "local_access_v1"
+CONTROL_POSITION_KEY = "control_position_v1"
+
 # Edge flags (design doc §6, plus `fallthrough` for switch chains). The sorted
 # flag set is the edge id's discriminator, so the exact spelling is frozen:
 # renaming a flag changes every id in the database.
@@ -89,14 +96,14 @@ _ANNOTATED_EVENT_TYPES = frozenset(
 _ASSIGNMENT_NODES = frozenset({"init_declarator", "assignment_expression"})
 
 # The event types that are published but never connected (stage 5A). An access
-# is a fact about an expression, not a position control flow can reach: giving
-# it an edge would put it on a `find_paths` path, change which paths the
-# `max_paths` truncation keeps, and move the stage 5C rulings that were
-# measured against the current path set. Enforced in `_emit`, which is the one
-# function every edge goes through, and it raises rather than dropping the edge
-# silently -- this can only be broken by an edit to the walker, never by source
-# code, so it must be loud.
-_EDGELESS_EVENT_TYPES = ACCESS_EVENTS
+# remains a fact about an expression rather than a new node on existing query
+# paths: giving it an edge would change `find_paths` results and path budgets.
+# V1 publishes its incoming control position as an annotation instead. Local
+# declarations use the same edgeless carrier. Enforced in `_emit`, which is the
+# one function every edge goes through, and it raises rather than dropping the
+# edge silently -- this can only be broken by an edit to the walker, never by
+# source code, so it must be loud.
+_EDGELESS_EVENT_TYPES = ACCESS_EVENTS | frozenset({DECLARATION})
 
 # Which child of a statement is the object being written. Position is the only
 # signal there is: no keyword in `x = y` says which side is the write.
@@ -137,22 +144,12 @@ DECLARED_FIELDS: dict[str, str] = {
 # call is what is being invoked, not an object being touched.
 ACCESS_SKIP_FIELDS: dict[str, str] = {"call_expression": "function"}
 
-# The storage classes an access is emitted for. Stage 5A's rule was: the
-# filter is not an optimisation, it is the identity -- `_facts_for` gives a
-# `local` or a `parameter` a token scoped to the method, so such an object
-# can never be half of a cross-method pair. Stage 5B keeps the identity
-# claim and narrows the exception: a `parameter` WRITE is published (only
-# the write side -- the read side has no in-frame consumer) because the
-# query-time parameter join composes cross-method pairs from it, in the
-# caller's terms, without ever minting a cross-method edge. The method-
-# scoped token means these writes still cannot pair on their own, and the
-# race query's `multi_method_subjects_by_storage` continues to report zero.
-# `function_static` is emitted: its token carries no scope at all (the
-# declaration index only stamps a class for a field and a path for a
-# file_static), so it merges repo-wide by name and is genuinely shared.
-# `unknown` is emitted because a cross-file global is the most valuable race
-# subject there is and it is exactly what a name with no declaration looks
-# like; the noise that comes with it is reported, not hidden.
+# Which storage classes publish a legacy access. V1 ordinary locals are admitted
+# separately in `_access_point`, rather than added here: downstream escape
+# classification also derives from this set and must retain its old meaning.
+# Shared-storage accesses retain their original identity semantics. Parameters
+# retain the historical write-only rule below. New local events stay edgeless,
+# exactly like the existing access population.
 ACCESS_STORAGES = frozenset({
     STORAGE_FIELD, STORAGE_FILE_STATIC, STORAGE_FUNCTION_STATIC, STORAGE_GLOBAL,
     STORAGE_PARAMETER, STORAGE_UNKNOWN,
@@ -275,6 +272,41 @@ def _span(node: Any) -> tuple[int, int] | None:
     return None if node is None else (node.start_byte, node.end_byte)
 
 
+def _defined_macro_names(root: Any, source: bytes) -> set[str]:
+    names: set[str] = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type in {"preproc_def", "preproc_function_def"}:
+            name = node.child_by_field_name("name")
+            if name is not None:
+                names.add(_text_of(source, name))
+        stack.extend(node.named_children)
+    return names
+
+
+def _declaration_shape_keys(
+    root: Any, source: bytes, kinds: frozenset[str]
+) -> set[tuple[int, str]]:
+    """Declaration-index keys whose declarator contains one of ``kinds``."""
+    keys: set[tuple[int, str]] = set()
+
+    def contains(node: Any) -> bool:
+        return node.type in kinds or any(contains(child) for child in node.named_children)
+
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "declaration":
+            for declarator in node.children_by_field_name("declarator"):
+                if contains(declarator):
+                    name = _declarator_name(source, declarator)
+                    if name:
+                        keys.add((node.start_byte, name))
+        stack.extend(node.named_children)
+    return keys
+
+
 def _outermost_access(node: Any, access_types: frozenset[str]) -> Any:
     """The access expression a target denotes, skipping parens and casts.
 
@@ -365,6 +397,7 @@ class SparseCfgBuilder:
         # Direct array declarator identity, including array-adjusted parameters.
         # Unlike extents, this syntax set is also used only to orient subscripts.
         self._array_declaration_keys: set[tuple[int, str]] = set()
+        self._reference_declaration_keys: set[tuple[int, str]] = set()
         # Exact declaration/type syntax for V1's one-level member type evidence.
         # Declaration.type_token is deliberately shallow and must never select a
         # same-spelled class or tag by itself.
@@ -415,11 +448,19 @@ class SparseCfgBuilder:
         self._switches: list[_SwitchContext] = []
         self._handlers: list[_HandlerContext] = []
         self._pending_throws: list[tuple[list[_Open], _HandlerContext]] = []
+        # V1 local declaration/access state. Coverage is method-wide: when any
+        # unsupported control or write-through shape is present, every local
+        # declaration in that method explicitly says the analysis is unknown.
+        self._file_partial = False
+        self._macro_names: set[str] = set()
+        self._coverage_reasons: set[str] = set()
 
     # ------------------------------------------------------------------
     # entry points
 
     def build(self, root: Any) -> ParsedCfg:
+        self._file_partial = bool(getattr(root, "has_error", False))
+        self._macro_names = _defined_macro_names(root, self.source)
         (
             self._array_extents,
             self._array_declaration_keys,
@@ -427,6 +468,9 @@ class SparseCfgBuilder:
             self._value_type_definitions,
             self._value_type_aliases,
         ) = _collect_array_extents(root, self.source)
+        self._reference_declaration_keys = _declaration_shape_keys(
+            root, self.source, frozenset({"reference_declarator"})
+        )
         (
             self._statement_declaration_scopes,
             self._statement_declaration_names,
@@ -437,6 +481,7 @@ class SparseCfgBuilder:
         for span_key in sorted(nodes_by_span):
             self._build_method(spans[span_key], nodes_by_span[span_key])
         self._assign_ordinals()
+        self._annotate_control_positions()
         return ParsedCfg(
             # The public shape: a ParsedPoint per point, flags in their sorted
             # canonical form. `matched_via` says which of the walker's two
@@ -479,9 +524,11 @@ class SparseCfgBuilder:
             return
         self._span = span
         self._has_points = False
+        self._coverage_reasons = {"partial_parse"} if self._file_partial else set()
         try:
             _, opens = self._linearize(body, [_Open(None, ())])
         finally:
+            self._finalize_local_facts()
             self._span = None
             self._assign_target = None
             self._assign_exact = True
@@ -491,6 +538,7 @@ class SparseCfgBuilder:
             self._switches = []
             self._handlers = []
             self._pending_throws = []
+            self._coverage_reasons = set()
         if not self._has_points:
             return
         self._annotate_escapes(span)
@@ -502,6 +550,276 @@ class SparseCfgBuilder:
         for open_edge in opens:
             if open_edge.src is not None:
                 self._emit(open_edge.src, _EXIT, open_edge.flags)
+
+    @staticmethod
+    def _declarator_contains(node: Any, kinds: frozenset[str]) -> bool:
+        if node is None:
+            return False
+        if node.type in kinds:
+            return True
+        return any(
+            SparseCfgBuilder._declarator_contains(child, kinds)
+            for child in node.named_children
+        )
+
+    def _local_declaration_points(self, node: Any) -> list[_Point]:
+        """Publish one edgeless fact per method-local declarator.
+
+        Positive definite-assignment support is deliberately limited to built-
+        in scalar and direct pointer objects. Other declarations retain their
+        stable syntax identity with `status=unsupported`; they are never
+        silently treated as initialized or as ordinary automatic scalars.
+        """
+        if node.type != "declaration":
+            return []
+        points: list[_Point] = []
+        for declarator in node.children_by_field_name("declarator"):
+            name = _declarator_name(self.source, declarator)
+            if not name:
+                continue
+            declaration = None
+            if self.declarations is not None:
+                candidate = self.declarations.resolve(node.start_byte, name)
+                if (
+                    candidate is not None
+                    and candidate.start_byte == node.start_byte
+                    and candidate.name == name
+                    and candidate.storage in {STORAGE_LOCAL, STORAGE_FUNCTION_STATIC}
+                ):
+                    declaration = candidate
+            # DeclarationIndex intentionally knows more than this V1 consumes.
+            # A non-local declaration nested in a method (for example a field
+            # declaration inside a local class) is not a local object fact.
+            if declaration is None and self.declarations is not None:
+                candidate = self.declarations.resolve(node.start_byte, name)
+                if candidate is not None and candidate.storage not in {
+                    STORAGE_LOCAL, STORAGE_FUNCTION_STATIC
+                }:
+                    continue
+
+            specifiers = {
+                self._text(child)
+                for child in node.children
+                if child.type in {"storage_class_specifier", "type_qualifier"}
+            }
+            if "extern" in specifiers:
+                storage_class = "extern"
+            elif specifiers & {"thread_local", "_Thread_local"}:
+                storage_class = "thread_local"
+            elif declaration is not None and declaration.storage == STORAGE_FUNCTION_STATIC:
+                storage_class = "static"
+            elif "register" in specifiers:
+                storage_class = "register"
+            else:
+                storage_class = "automatic"
+
+            is_pointer = (
+                declaration.is_pointer if declaration is not None
+                else self._declarator_contains(declarator, frozenset({"pointer_declarator"}))
+            )
+            # A block-scope function declaration is not an object definition.
+            # Pointer-to-function declarators remain pointer objects.
+            if declarator.type == "function_declarator" and not is_pointer:
+                continue
+            unsupported_shape = self._declarator_contains(
+                declarator, frozenset({"array_declarator", "reference_declarator"})
+            )
+            type_node = node.child_by_field_name("type")
+            scalar_type = type_node is not None and type_node.type in {
+                "primitive_type", "enum_specifier",
+            }
+            if unsupported_shape:
+                kind = "unsupported"
+                limitation = "array and reference objects are outside local declaration V1"
+            elif is_pointer:
+                kind = "pointer"
+                limitation = ""
+            elif scalar_type:
+                kind = "scalar"
+                limitation = ""
+            else:
+                kind = "unsupported"
+                limitation = "only built-in scalar and direct pointer declarations are supported"
+            if declaration is None:
+                kind = "unsupported"
+                limitation = "local declaration identity is unresolved"
+                self._coverage_reasons.add("unresolved_declaration")
+            if storage_class == "extern":
+                kind = "unsupported"
+                limitation = "a local extern declaration is not an automatic object definition"
+
+            value = (
+                declarator.child_by_field_name("value")
+                if declarator.type == "init_declarator" else None
+            )
+            zero_initialized = storage_class in {"static", "thread_local"}
+            initialized: bool | None = False
+            initializer = "none"
+            if storage_class == "extern":
+                initialized = None
+                initializer = "not_applicable"
+                zero_initialized = False
+            elif value is not None:
+                initialized = True
+                initializer = "expression"
+                if value.type == "initializer_list" and not value.named_children:
+                    # C++ `T x{}` / `T x = {}` value-initializes the object.
+                    zero_initialized = True
+                    initializer = "zero_initialized"
+            elif zero_initialized:
+                initialized = True
+                initializer = "zero_initialized"
+            elif kind == "unsupported":
+                # A class object's default constructor, an unresolved type, or
+                # another unsupported shape is not evidence of no initialization.
+                initialized = None
+                initializer = "unknown"
+            scoped = (
+                self.declarations.scoped_identity(declaration)
+                if declaration is not None and self.declarations is not None else ""
+            )
+            legacy = self._facts_for(declaration, "", "true") if declaration is not None else {}
+            fact = {
+                "declaration": scoped,
+                "decl": legacy.get("subject_decl", ""),
+                "storage": declaration.storage if declaration is not None else STORAGE_LOCAL,
+                "storage_class": storage_class,
+                "type": declaration.type_token if declaration is not None else "",
+                "kind": kind,
+                "status": "supported" if kind != "unsupported" else "unsupported",
+                "initialized": initialized,
+                "initializer": initializer,
+                "initializer_expression": self._text(value) if value is not None else None,
+                "initializer_start_byte": value.start_byte if value is not None else None,
+                "initializer_end_byte": value.end_byte if value is not None else None,
+                "zero_initialized": zero_initialized,
+                "limitation": limitation,
+            }
+            point = self._new_point(
+                DECLARATION,
+                declarator,
+                annotations={LOCAL_DECLARATION_KEY: _facts_json(fact)},
+                matched_name=name,
+            )
+            points.append(point)
+        return points
+
+    def _finalize_local_facts(self) -> None:
+        reasons = tuple(sorted(self._coverage_reasons))
+        owner_key = (self._span.kind, self._span.qualified_name, self._span.signature)
+        for point in self._points:
+            if (
+                point.owner_kind,
+                point.owner_qualified_name,
+                point.owner_signature,
+            ) != owner_key:
+                continue
+            keys = [
+                key for key in (LOCAL_DECLARATION_KEY, LOCAL_ACCESS_KEY)
+                if key in point.annotations
+            ]
+            if not keys:
+                continue
+            # Retained until `_annotate_control_positions`, after ordinals are
+            # assigned. Empty tuple means complete; None means not a V1 fact.
+            point.local_coverage = reasons
+            for key in keys:
+                fact = json.loads(point.annotations[key])
+                fact["coverage_status"] = "unknown" if reasons else "complete"
+                fact["coverage_reasons"] = list(reasons)
+                point.annotations[key] = _facts_json(fact)
+
+    def _local_declaration_identity(self, node: Any, name: str) -> tuple[Any, str]:
+        if self.declarations is None or not name:
+            return None, ""
+        declaration = self._resolve_extent_declaration(node, name)
+        if declaration is None or declaration.storage not in {
+            STORAGE_LOCAL, STORAGE_FUNCTION_STATIC,
+        }:
+            return None, ""
+        return declaration, self.declarations.scoped_identity(declaration)
+
+    def _supported_local_object(self, declaration: Any) -> bool:
+        if declaration is None:
+            return False
+        key = (declaration.start_byte, declaration.name)
+        if key in self._array_declaration_keys or key in self._reference_declaration_keys:
+            return False
+        if declaration.is_pointer:
+            return True
+        type_node = self._value_declaration_types.get(key)
+        return type_node is not None and type_node.type in {
+            "primitive_type", "enum_specifier",
+        }
+
+    def _unknown_address_of_in_call(self, node: Any) -> None:
+        if node.type != "pointer_expression" or _operator_of(node, self.source) != "&":
+            return
+
+        def record(argument: Any) -> None:
+            name = self._root_identifier(argument)
+            if not name:
+                return
+            facts = self._subject_facts(argument, name)
+            if facts.get("subject_storage") in {STORAGE_LOCAL, STORAGE_FUNCTION_STATIC}:
+                self._coverage_reasons.add("unknown_write_through")
+
+        argument = node.child_by_field_name("argument")
+        ancestor = node.parent
+        while ancestor is not None and ancestor.type not in {
+            "declaration", "expression_statement", "return_statement",
+        }:
+            if ancestor.type == "call_expression":
+                record(argument)
+                return
+            if ancestor.type == "init_declarator":
+                value = ancestor.child_by_field_name("value")
+                if value is not None and value.type in {"argument_list", "initializer_list"}:
+                    # C++ direct/brace construction has no call_expression node,
+                    # but its constructor receives the same pointer argument.
+                    record(argument)
+                return
+            ancestor = ancestor.parent
+
+    def _unknown_pointer_argument(self, node: Any) -> None:
+        """A call or C++ constructor may write through a local pointer argument."""
+        if node.type == "call_expression":
+            arguments = node.child_by_field_name("arguments")
+        elif node.type == "init_declarator":
+            arguments = node.child_by_field_name("value")
+            if arguments is not None and arguments.type not in {
+                "argument_list", "initializer_list",
+            }:
+                arguments = None
+        elif node.type == "declaration":
+            # `B b(p)` is a function_declarator in tree-sitter's ambiguous
+            # parse. If `p` is a local pointer, a C++ consumer cannot treat the
+            # shape as a prototype and silently miss possible constructor
+            # write-through; keep the whole method fail-closed instead.
+            declarator = node.child_by_field_name("declarator")
+            arguments = (
+                declarator.child_by_field_name("parameters")
+                if declarator is not None and declarator.type == "function_declarator"
+                else None
+            )
+        else:
+            arguments = None
+        if arguments is None:
+            return
+        stack = list(arguments.named_children)
+        while stack:
+            current = stack.pop()
+            if current.type in {"identifier", "type_identifier"}:
+                name = self._text(current)
+                declaration = self._resolve_extent_declaration(current, name)
+                if (
+                    declaration is not None
+                    and declaration.storage in {STORAGE_LOCAL, STORAGE_FUNCTION_STATIC}
+                    and declaration.is_pointer
+                ):
+                    self._coverage_reasons.add("unknown_write_through")
+                    return
+            stack.extend(current.named_children)
 
     def _annotate_escapes(self, span: Any) -> None:
         """Link frame-local allocations to the writes that let them escape.
@@ -690,6 +1008,55 @@ class SparseCfgBuilder:
             if point.annotations:
                 self._annotations[point.key()] = point.annotations
 
+    def _annotate_control_positions(self) -> None:
+        """Serialize edgeless local facts' incoming control positions.
+
+        Anchor identity is the same owner-local `(event_type, ordinal)` pair
+        used by the published node. Flags are the exact flags that would ride
+        on a threaded edge. No source line, spelling, or array position is a
+        join key, and no READ/WRITE/DECLARATION endpoint enters existing CFG
+        paths.
+        """
+        for point in self._points:
+            incoming = point.control_incoming
+            if incoming is None:
+                continue
+            predecessors = []
+            entry = False
+            seen = set()
+            for open_edge in incoming:
+                if open_edge.src is None:
+                    entry = True
+                    continue
+                item = (
+                    open_edge.src.event_type,
+                    open_edge.src.ordinal,
+                    tuple(sorted(open_edge.flags)),
+                )
+                if item not in seen:
+                    seen.add(item)
+                    predecessors.append(item)
+            predecessors.sort()
+            fact = {
+                "status": (
+                    "unknown" if point.local_coverage
+                    else "reachable" if incoming else "unreachable"
+                ),
+                "entry": entry,
+                "predecessors": [
+                    {
+                        "event_type": event_type,
+                        "ordinal": ordinal,
+                        "flags": list(flags),
+                    }
+                    for event_type, ordinal, flags in predecessors
+                ],
+                "coverage_status": "unknown" if point.local_coverage else "complete",
+                "coverage_reasons": list(point.local_coverage or ()),
+            }
+            point.annotations[CONTROL_POSITION_KEY] = _facts_json(fact)
+            self._annotations[point.key()] = point.annotations
+
     def _parsed_edges(self) -> list[ParsedEdge]:
         edges: list[ParsedEdge] = []
         seen: set[ParsedEdge] = set()
@@ -722,6 +1089,25 @@ class SparseCfgBuilder:
             # Lambda bodies carry no span and stay inlined here, which is the
             # event layer's attribution too.
             return None, list(incoming)
+        if getattr(node, "has_error", False) or node.type == "ERROR":
+            self._coverage_reasons.add("partial_parse")
+        if node.type.startswith("preproc_") or "macro" in node.type:
+            self._coverage_reasons.add("macro")
+        if node.type in {"identifier", "type_identifier", "field_identifier"}:
+            if self._text(node) in self._macro_names:
+                self._coverage_reasons.add("macro")
+        if node.type == "goto_statement":
+            self._coverage_reasons.add("goto")
+        if node.type in {"while_statement", "do_statement", "for_statement", "for_range_loop"}:
+            self._coverage_reasons.add("unsupported_loop")
+        if node.type in {"switch_statement", "conditional_expression"}:
+            self._coverage_reasons.add("unsupported_conditional")
+        if node.type == "lambda_expression":
+            self._coverage_reasons.add("unsupported_lambda")
+        if node.type in {"try_statement", "catch_clause", "throw_statement"}:
+            self._coverage_reasons.add("unsupported_exception")
+        self._unknown_address_of_in_call(node)
+        self._unknown_pointer_argument(node)
         handler = _CONTROL_HANDLERS.get(node.type)
         if handler is not None or node.type in _CONDITIONAL_STATEMENTS:
             # The whole construct -- heading and arms -- walks one level
@@ -836,7 +1222,9 @@ class SparseCfgBuilder:
         structural = self._structural_point(node)
         if structural is not None:
             threaded.append(structural)
-        return threaded, self._access_points(node)
+        event_only = self._access_points(node)
+        event_only.extend(self._local_declaration_points(node))
+        return threaded, event_only
 
     def _thread_own_points(
         self, node: Any, entry: "_Point | None", current: list[_Open]
@@ -851,9 +1239,16 @@ class SparseCfgBuilder:
         edges and the `do` statement's true arm -- real edges into an edgeless
         event type, which is the one thing this stage must not do.
         """
-        threaded, _event_only = self._own_points(node)
+        threaded, event_only = self._own_points(node)
+        for point in event_only:
+            if point.event_type == DECLARATION or LOCAL_ACCESS_KEY in point.annotations:
+                point.control_incoming = list(current)
         noreturn = False
         for point in threaded:
+            if LOCAL_ACCESS_KEY in point.annotations:
+                # DEREFERENCE remains threaded; retain the incoming position
+                # before `_connect` replaces it with the dereference itself.
+                point.control_incoming = list(current)
             current = self._connect(current, point)
             if entry is None:
                 entry = point
@@ -1585,6 +1980,18 @@ class SparseCfgBuilder:
             # name-based join, and the stage's reduction would be half of what
             # the declaration index actually buys.
             annotations.update(self._subject_facts(operand, subject))
+            if annotations.get("subject_storage") in {STORAGE_LOCAL, STORAGE_FUNCTION_STATIC}:
+                declaration, scoped = self._local_declaration_identity(operand, subject)
+                supported = bool(scoped) and declaration is not None and declaration.is_pointer
+                annotations[LOCAL_ACCESS_KEY] = _facts_json({
+                    "declaration": scoped,
+                    "direction": "DEREFERENCE",
+                    "target": "pointer",
+                    "status": "supported" if supported else "unsupported",
+                    "limitation": "" if supported else "only a resolved local pointer dereference is supported",
+                })
+                if not scoped:
+                    self._coverage_reasons.add("unresolved_declaration")
         extent = self._buffer_extent_facts(node, annotations)
         if extent is not None:
             annotations[BUFFER_EXTENT_KEY] = _facts_json(extent)
@@ -2144,20 +2551,28 @@ class SparseCfgBuilder:
                     read_point = self._access_point(written, "READ", origin=node)
                     if read_point is not None:
                         points.append(read_point)
-        # F1 (SUB-09/R6): bounded indirect field-callee READ. In C, a call
-        # whose callee is a field_expression (`g_timePara.procFunc()`) reads a
-        # function-pointer field -- there are no member functions in C, so the
-        # call site is a read of that shared slot. `ACCESS_SKIP_FIELDS` removes
-        # the callee from the generic child-read loop below; this is the one
-        # place that re-admits it, and only as an additive READ stamped
-        # `is_indirect=true`. Every other callee shape (`foo()`, `(*fp)()`,
-        # `table[i]()`, nested calls) and the whole C++ path are left as-is.
-        if node.type == "call_expression" and self.profile.name == "c":
+        # F1 (SUB-09/R6): bounded indirect callee READs. In C, a field callee
+        # reads a function-pointer slot. In both languages, a direct callee
+        # resolved to a method-local pointer is also an ordinary local READ:
+        # skipping every callee would otherwise make uninitialized `fp()` uses
+        # invisible. Other callee shapes keep their existing DEREFERENCE/nested
+        # expression handling rather than being guessed into a direct access.
+        if node.type == "call_expression":
             callee = node.child_by_field_name("function")
-            if callee is not None and callee.type == "field_expression":
+            if (
+                self.profile.name == "c"
+                and callee is not None and callee.type == "field_expression"
+            ):
                 point = self._access_point(callee, "READ", indirect_callee=True)
                 if point is not None:
                     points.append(point)
+            if callee is not None and callee.type == "identifier":
+                name = self._text(callee)
+                declaration, _scoped = self._local_declaration_identity(callee, name)
+                if declaration is not None and declaration.is_pointer:
+                    point = self._access_point(callee, "READ", indirect_callee=True)
+                    if point is not None:
+                        points.append(point)
         skip_fields = (DECLARED_FIELDS.get(node.type), ACCESS_SKIP_FIELDS.get(node.type))
         skip = {
             _span(node.child_by_field_name(field))
@@ -2235,6 +2650,25 @@ class SparseCfgBuilder:
         rhs = origin.child_by_field_name(rhs_field) if rhs_field else None
         return self._is_null_literal(rhs)
 
+    def _is_declarator_name(self, expr: Any) -> bool:
+        """Whether an identifier is the name being declared, not an initializer."""
+        ancestor = expr.parent
+        while ancestor is not None and ancestor.type != "declaration":
+            if ancestor.type == "init_declarator":
+                value = ancestor.child_by_field_name("value")
+                if (
+                    value is not None
+                    and value.start_byte <= expr.start_byte < value.end_byte
+                ):
+                    return False
+            ancestor = ancestor.parent
+        if ancestor is None:
+            return False
+        return any(
+            declarator.start_byte <= expr.start_byte < declarator.end_byte
+            for declarator in ancestor.children_by_field_name("declarator")
+        )
+
     def _access_point(
         self, expr: Any, event_type: str, origin: Any = None, indirect_callee: bool = False
     ) -> _Point | None:
@@ -2275,7 +2709,42 @@ class SparseCfgBuilder:
             and origin is not None
             and self._writes_null(origin)
         )
-        if storage not in ACCESS_STORAGES and not bare_copy and not null_write:
+        legacy_local = bare_copy or null_write
+        ordinary_local = storage == STORAGE_LOCAL and not legacy_local
+        declarator_name = event_type == "READ" and self._is_declarator_name(expr)
+        if ordinary_local and declarator_name:
+            # A declarator's nested identifier is not a use. Initializer reads
+            # are explicitly excluded by `_is_declarator_name` and remain.
+            return None
+        # Function-static declarator names retain their pre-existing legacy
+        # READ, but must not acquire a V1 access: declaration is not a use.
+        v1_storage = (
+            not declarator_name
+            and storage in {STORAGE_LOCAL, STORAGE_FUNCTION_STATIC}
+        )
+        declaration = None
+        scoped = ""
+        if v1_storage:
+            declaration, scoped = self._local_declaration_identity(expr, subject)
+            direct = expr.type == "identifier"
+            if event_type == "WRITE" and not direct:
+                self._coverage_reasons.add("unknown_write_through")
+            key = (
+                (declaration.start_byte, declaration.name)
+                if declaration is not None else None
+            )
+            if key in self._reference_declaration_keys:
+                self._coverage_reasons.add(
+                    "unknown_write_through" if event_type == "WRITE"
+                    else "unsupported_reference"
+                )
+            if ordinary_local and (
+                not direct or not scoped or not self._supported_local_object(declaration)
+            ):
+                if not scoped:
+                    self._coverage_reasons.add("unresolved_declaration")
+                return None
+        if storage not in ACCESS_STORAGES and not ordinary_local and not bare_copy and not null_write:
             return None
         if storage == STORAGE_PARAMETER and event_type != "WRITE":
             # Stage 5B publishes the write side of a parameter only. The
@@ -2288,18 +2757,37 @@ class SparseCfgBuilder:
             return None
         text = self._text(expr)
         annotations = {"expression": text}
-        annotations["subject"] = subject
-        annotations.update(facts)
-        extent = self._buffer_extent_facts(expr, annotations)
+        if not ordinary_local:
+            # New V1 automatic-local accesses deliberately do not enter the
+            # legacy DFG subject channel. Their consumer joins
+            # `local_access_v1` to the declaration fact; existing
+            # bare-copy/null-write and function-static events retain every
+            # legacy annotation and therefore their old DFG behavior.
+            annotations["subject"] = subject
+            annotations.update(facts)
+        if v1_storage:
+            direct = expr.type == "identifier"
+            supported = (
+                bool(scoped) and direct and self._supported_local_object(declaration)
+            )
+            annotations[LOCAL_ACCESS_KEY] = _facts_json({
+                "declaration": scoped,
+                "direction": event_type,
+                "target": "direct" if direct else "indirect",
+                "status": "supported" if supported else "unsupported",
+                "limitation": "" if supported else "only direct resolved scalar/pointer objects are supported",
+            })
+        extent = None if ordinary_local else self._buffer_extent_facts(expr, annotations)
         if extent is not None:
             annotations[BUFFER_EXTENT_KEY] = _facts_json(extent)
-        access = _access_facts(
+        access = None if ordinary_local else _access_facts(
             expr, event_type, self.source, origin=origin,
             commuted=self._commuted_subscript(expr),
             pointer_commuted=self._commuted_pointer_addition(expr),
             cpp=self.profile.name == "cpp",
         )
-        access = self._filter_cpp_value_access(access, extent)
+        if access is not None:
+            access = self._filter_cpp_value_access(access, extent)
         if access is not None:
             access["object"] = (
                 extent.get("object") if extent is not None else _object_fact(annotations)
@@ -2329,7 +2817,7 @@ class SparseCfgBuilder:
             annotations["is_indirect"] = "true"
             if root and member:
                 annotations["field_path"] = f"{root}.{member}"
-        if event_type == "WRITE" and origin is not None:
+        if event_type == "WRITE" and origin is not None and not ordinary_local:
             # The escape half of 5C-2's 2.11: what the write *read*, and
             # whether the statement carrying it runs on every path of the
             # method. A later frame-local allocation whose pointer this write
@@ -4089,6 +4577,11 @@ class _Point:
     ordinal: int = -1
     flags: tuple[str, ...] = ()
     annotations: dict[str, str] = field(default_factory=dict)
+    # Edgeless local facts retain the walker's actual incoming opens until all
+    # source-order ordinals have been assigned. None means no V1 association.
+    control_incoming: list[_Open] | None = None
+    # Frozen method coverage for all three V1 annotation channels.
+    local_coverage: tuple[str, ...] | None = None
 
     def key(self) -> PointKey:
         return PointKey(
