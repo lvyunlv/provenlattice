@@ -37,6 +37,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .analysis_call_relation import build_call_site_clones
 from .analysis_query import query_analysis
 from .concurrency_lock_scenarios import _KNOWN_CALL_KINDS, build_access_lockset
 from .models import (
@@ -71,14 +72,26 @@ def _byte(value: Any) -> int:
     return int(value or 0)
 
 
-def build_concurrency_context(events: Iterable[Mapping[str, Any]]) -> dict:
+def build_concurrency_context(
+    events: Iterable[Mapping[str, Any]], *,
+    cloned_events: Iterable[Mapping[str, Any]] = (),
+    call_site_clones: Iterable[Mapping[str, Any]] | None = None,
+) -> dict:
     """Build the concurrency_context bundle from sparse_cfg events.
 
     ``events`` is the ``env["events"]`` list of a ``sparse_cfg`` query. The
     function is pure and deterministic: the same events yield the same bundle,
     with keys and lists in stable order.
+
+    D1 (issue-pilot#91): ``cloned_events`` are the query-time call-site clones
+    from ``analysis_call_relation.build_call_site_clones``.  They are rows in
+    the same shape as sparse_cfg events whose owner is the caller, so they join
+    the same access / thread-context machinery without a second schema.  The
+    optional ``call_site_clones`` audit records are re-exposed on the bundle,
+    and are absent when the caller does not supply them (the legacy output is
+    byte-identical).
     """
-    events = list(events)
+    events = list(events) + list(cloned_events)
     spawns: list[Mapping[str, Any]] = []
     joins: list[Mapping[str, Any]] = []
     entry_points: set[str] = set()
@@ -262,7 +275,7 @@ def build_concurrency_context(events: Iterable[Mapping[str, Any]]) -> dict:
             "candidate_state": "unresolved" if unresolved else "ambiguous",
         })
 
-    return {
+    bundle = {
         "thread_entry_points": sorted(entry_points),
         "spawns": spawn_facts,
         "joins": join_facts,
@@ -272,6 +285,21 @@ def build_concurrency_context(events: Iterable[Mapping[str, Any]]) -> dict:
         "missing_evidence": sorted(missing_evidence),
         "capability_gaps": capability_gaps,
     }
+    if call_site_clones is not None:
+        bundle["call_site_clones"] = list(call_site_clones)
+    return bundle
+
+
+def _clone_call_sites(repo, database, env: Mapping[str, Any]) -> dict:
+    """Run D1's query-time clone over the same file's sparse_cfg facts."""
+    root = Path(repo).resolve()
+    path = (
+        Path(database).resolve() if database
+        else root / ".provenlattice" / "codegraph.db"
+    )
+    with SQLiteStorage(path) as storage:
+        return build_call_site_clones(
+            env.get("events", []), env.get("file_id"), storage)
 
 
 def query_concurrency_context(
@@ -283,11 +311,30 @@ def query_concurrency_context(
     own honest status (``unsupported`` / ``not_built`` / ``stale``) -- this
     capability is C/C++ only and never fabricates a context where its inputs are
     absent.
+
+    D1 (issue-pilot#91): the caller's derived contexts are supplied by the
+    query-time call-site clone.  The clone is additive and fail-closed; if it
+    cannot be derived the base context is returned with an honest gap rather
+    than failing the whole query.
     """
     env = query_analysis(repo, "sparse_cfg", file_path=file_path, database=database)
     if env["status"] != "available":
         return {"status": env["status"], "reason": env.get("reason")}
-    context = build_concurrency_context(env.get("events", []))
+    try:
+        clones = _clone_call_sites(repo, database, env)
+    except Exception as error:  # noqa: BLE001 -- additive reader, fail closed
+        context = build_concurrency_context(env.get("events", []), call_site_clones=[])
+        context["missing_evidence"] = sorted(
+            set(context["missing_evidence"]) | {"call_site_clone_unavailable"})
+        context["capability_gaps"].append(
+            "call-site clone derivation failed: %s" % (type(error).__name__,))
+        context["status"] = "available"
+        return context
+    context = build_concurrency_context(
+        env.get("events", []),
+        cloned_events=clones.get("events", ()),
+        call_site_clones=clones.get("call_sites", ()),
+    )
     context["status"] = "available"
     return context
 

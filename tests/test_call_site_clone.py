@@ -35,7 +35,10 @@ from provenlattice.analysis_call_relation import (
     build_call_site_clones,
     query_call_site_clones,
 )
-from provenlattice.analysis_concurrency_context import build_concurrency_context
+from provenlattice.analysis_concurrency_context import (
+    build_concurrency_context,
+    query_concurrency_context,
+)
 from provenlattice.analysis_query import query_analysis
 from provenlattice.graph import full_index
 from provenlattice.orchestrator import analyze_scope
@@ -406,6 +409,31 @@ class ConcurrencyContextIntegrationTests(CallSiteCloneTestBase):
         self.assertEqual(candidate["thread_entry_owners"], ["t_a", "t_b"])
         self.assertEqual(candidate["owners"], ["helper", "t_a", "t_b"])
         self.assertTrue(candidate["evidence_references"])
+
+    def test_query_concurrency_context_is_wired_to_the_clone(self):
+        context = query_concurrency_context(
+            self.root, self.FILENAME, database=self.database)
+        self.assertEqual(context["status"], "available")
+        sites = context["call_site_clones"]
+        helper_sites = [site for site in sites if site["callee"] == "helper"]
+        self.assertEqual(len(helper_sites), 2)
+        subjects = [
+            subject for subject in context["may_parallel"]
+            if subject["subject"] == "shared_value"
+        ]
+        self.assertEqual(len(subjects), 1)
+        self.assertEqual(subjects[0]["thread_entry_owners"], ["t_a", "t_b"])
+        self.assertEqual(subjects[0]["owners"], ["helper", "t_a", "t_b"])
+        again = query_concurrency_context(
+            self.root, self.FILENAME, database=self.database)
+        self.assertEqual(
+            json.dumps(context, sort_keys=True),
+            json.dumps(again, sort_keys=True),
+        )
+
+    def test_legacy_build_output_is_unchanged_without_clones(self):
+        context = build_concurrency_context(self.events())
+        self.assertNotIn("call_site_clones", context)
 
 
 class BuildCallSiteClonesIsPureTests(CallSiteCloneTestBase):
