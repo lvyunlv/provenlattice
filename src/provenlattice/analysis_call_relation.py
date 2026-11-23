@@ -99,7 +99,13 @@ def build_call_relation(
         annotations = _annotations(event)
         decl = annotations.get("subject_decl", "")
         member = annotations.get("subject_member", "")
-        if event_type == "READ" and annotations.get("is_indirect") == "true":
+        if (
+            event_type == "READ"
+            and annotations.get("is_indirect") == "true"
+            and "local_access_v1" not in annotations
+        ):
+            # V1 local callee facts feed definite assignment only. They are not
+            # F1 shared-slot evidence and must not create legacy call relations.
             reads_by_slot.setdefault((decl, member), []).append(
                 event.get("event_id"))
         elif event_type == "WRITE" and annotations.get("write_source"):

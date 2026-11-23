@@ -8,9 +8,10 @@ binds per argument root, and each binding mints one direct DATA_FLOW_TO edge
 whose metadata keeps the intermediates. Registered approximations travel with
 it and are asserted as behaviour, never hidden:
 
-* access events are filtered by storage class -- STORAGE_LOCAL is excluded
-  (a local does not outlive the frame; ALLOC/RELEASE chains for local
-  resources still flow), parameters publish their WRITE side only;
+* #84 local READ/WRITE facts use only their additive V1 identity channel and
+  do not enter this legacy DFG; pre-existing local bare-copy/null-write
+  exceptions retain their original subject annotations and behavior.
+  Parameters publish their WRITE side only;
 * a READ and a RETURN over the same expression are two separate uses, each
   minting its own edge;
 * access points are published-and-never-connected
@@ -81,7 +82,8 @@ class DfgTestBase(unittest.TestCase):
 
     def write_event_at(self, relative: str, line: int) -> dict:
         matches = [e for e in self.events_for(relative)
-                   if e["event_type"] == "WRITE" and e["start_line"] == line]
+                   if e["event_type"] == "WRITE" and e["start_line"] == line
+                   and "subject_decl" in e.get("annotations", {})]
         self.assertEqual(len(matches), 1, (relative, line))
         return matches[0]
 
@@ -171,12 +173,10 @@ class FieldFlowTests(DfgTestBase):
 
 
 class LocalBoundaryTests(DfgTestBase):
-    def test_plain_local_def_use_is_outside_the_access_model(self) -> None:
-        # Registered boundary: STORAGE_LOCAL is excluded from
-        # ACCESS_STORAGES -- a local does not outlive the frame, so no
-        # READ/WRITE access events are emitted for it and no DATA_FLOW_TO
-        # edge can mint. The RETURN's subject annotation still names the
-        # local (the fact channel works; only the access channel is scoped).
+    def test_plain_local_facts_stay_outside_legacy_dfg(self) -> None:
+        # #84 publishes ordinary local READ/WRITE facts in the additive V1
+        # annotation channel. They deliberately omit the legacy DFG subject
+        # channel, so the old direct def-use result remains unchanged.
         env = self.build(
             "int f18(int n) {\n"
             "    int x = n;\n"
@@ -185,7 +185,12 @@ class LocalBoundaryTests(DfgTestBase):
         self.assertEqual(self.value_edges(), [])
         writes = [e for e in self.events_for("src/t.c")
                   if e["event_type"] == "WRITE"]
-        self.assertEqual(writes, [])
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(
+            json.loads(writes[0]["annotations"]["local_access_v1"])["direction"],
+            "WRITE",
+        )
+        self.assertNotIn("subject", writes[0]["annotations"])
         returns = [e for e in self.events_for("src/t.c")
                    if e["event_type"] == "RETURN"]
         self.assertEqual(len(returns), 1)
