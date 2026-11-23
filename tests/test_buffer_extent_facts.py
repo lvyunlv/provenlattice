@@ -1590,7 +1590,7 @@ class BufferExtentFactsTests(unittest.TestCase):
         self.assertEqual(self.extent("DEREFERENCE", "buf[n-1]")["constant"], 65)
 
     def test_scfg_version_and_dfg_dependency_freshness(self) -> None:
-        self.assertEqual(ANALYZER_VERSIONS["sparse_cfg:cpp"], 7)
+        self.assertEqual(ANALYZER_VERSIONS["sparse_cfg:cpp"], 8)
         self.assertEqual(ANALYZER_VERSIONS["sparse_dfg:cpp"], 4)
         self.materialize("sparse_dfg")
         with closing(sqlite3.connect(self.database)) as connection:
@@ -1600,7 +1600,7 @@ class BufferExtentFactsTests(unittest.TestCase):
                 "AND file_id IN (SELECT file_id FROM files WHERE path='src/facts.c')"
             ).fetchone()
             metadata = json.loads(row["metadata"])
-            metadata["dependencies"]["sparse_cfg:cpp"] = "cpp-sparse_cfg-v5"
+            metadata["dependencies"]["sparse_cfg:cpp"] = "cpp-sparse_cfg-v6"
             connection.execute(
                 "UPDATE analysis_state SET metadata=? WHERE feature='sparse_dfg:cpp' "
                 "AND file_id IN (SELECT file_id FROM files WHERE path='src/facts.c')",

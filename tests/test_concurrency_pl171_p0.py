@@ -3,7 +3,7 @@
 Freezes the P0 detector behaviour changes against synthetic fixtures:
 
 1. pre-spawn access only      -> trimmed to <2, dropped  (PAIR-01)
-2. post-join + unguarded peer -> kept (NOT all-other-guarded, PAIR-05)
+2. post-join + unguarded peer -> filtered (join ordering alone, PAIR-05 / P2)
 3. mutex/mutex same lock      -> filtered  (PAIR-02)
 4. read-lock vs write-lock on one rwlock -> kept (PAIR-06 restores the TP)
 5. incomplete lock scope (UNLOCK_OMITTED_ON_PATH) -> kept
@@ -62,10 +62,10 @@ void starter(void) {
 }
 """
 
-# 2. PAIR-05: a post-join access on one end, with the *other* end unguarded, is
-# NOT provably safe (the guard "all other accesses correctly guarded" fails), so
-# the pair must stay. The old PAIR-03 dropped this -- the excluded cross-lifetime
-# over-fire the V2 contract fixes.
+# 2. PAIR-05: a post-join access on one end orders the pair against the other
+# end's thread entry; the other end does not additionally have to be guarded.
+# P2 removed the old "all other accesses correctly guarded" conjunction, so this
+# ordinary join-publishes-the-result shape is filtered.
 POST_JOIN = r"""
 #include <pthread.h>
 int shared = 0;
@@ -213,8 +213,8 @@ class PL171P0DetectorTests(unittest.TestCase):
     def test_01_pre_spawn_pair_filtered(self):
         self.assertEqual(_races(PRE_SPAWN), [])
 
-    def test_02_post_join_unguarded_peer_kept(self):
-        self.assertEqual(len(_races(POST_JOIN)), 1)
+    def test_02_post_join_unguarded_peer_filtered(self):
+        self.assertEqual(_races(POST_JOIN), [])
 
     def test_03_mutex_mutex_same_lock_filtered(self):
         self.assertEqual(_races(MUTEX_MUTEX), [])

@@ -44,7 +44,7 @@ LEVEL_0_EVENTS = frozenset({
 #   level 1. Declaring it lets the 2.1 row name what it needs and be reported as
 #   a gap, rather than leaving the row out and the gap unstated.
 LEVEL_1_EVENTS = frozenset({
-    "READ", "WRITE", "DEREFERENCE", "CHECK", "BRANCH",
+    "READ", "WRITE", "DEREFERENCE", "CHECK", "BRANCH", "DECLARATION",
     "OPEN", "CLOSE", "ACQUIRE", "WAIT", "SIGNAL", "CREATE", "DESTROY",
     "ARITH",
 })
@@ -60,7 +60,7 @@ KNOWN_EVENTS = LEVEL_0_EVENTS | LEVEL_1_EVENTS
 # DEREFERENCE rather than by a vocabulary keyword (no callee name describes
 # arithmetic). `defect_patterns.toml`'s 2.1 row names it, and `missing_events()`
 # reads this set to decide whether that requirement is met.
-STRUCTURAL_EVENTS = frozenset({"BRANCH", "CHECK", "DEREFERENCE", "ARITH"})
+STRUCTURAL_EVENTS = frozenset({"BRANCH", "CHECK", "DEREFERENCE", "ARITH", "DECLARATION"})
 
 # The access events (stage 5A) -- PR-only, not ported (I1-B).
 ACCESS_EVENTS = frozenset({"READ", "WRITE"})

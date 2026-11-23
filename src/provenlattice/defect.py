@@ -2717,12 +2717,11 @@ def race_condition(
                 if atomic_a and atomic_b:
                     disqualified_atomic += 1
                     continue
-                # PAIR-05 (safe post-join): drop only when one end is provably
-                # post-join AND every other access is correctly guarded.
+                # PAIR-05 (safe post-join): drop when one end is provably
+                # post-join; a bound join orders the pair by itself.
                 if _safe_post_join_declines(
                     owner_a, owner_b, points_a, points_b, points, spawn_index,
-                    names, protection_a, protection_b, lock_modes,
-                    race_fact_index.get("omitted") or set(), kind_a, kind_b,
+                    names,
                 ):
                     disqualified_post_lifecycle += 1
                     continue
@@ -3390,36 +3389,6 @@ def _lock_mode_covers(
     return True
 
 
-def _side_guarded(
-    protection: Mapping[str, Any],
-    kind: str,
-    owner: str,
-    lock_modes: Mapping[tuple[str, str], frozenset[str]],
-    omitted: set[tuple[str, str]],
-) -> bool:
-    """Whether one side's accesses are all correctly guarded (GRD good).
-
-    GRD good (derived, fail-closed): the side resolves to a common held lock the
-    producer attributed via PROTECTS (``status == RESOLVED``, so no limitation),
-    at least one such lock's acquire mode covers the side's access kind, and no
-    (access, lock) pair is UNLOCK_OMITTED_ON_PATH -- a lock that may leak does
-    not provably serialize the access.
-    """
-    if protection.get("status") != RESOLVED:
-        return False
-    locks = protection.get("locks") or ()
-    if not locks:
-        return False
-    access_ids = protection.get("access_event_ids") or ()
-    for lock in locks:
-        if not _lock_mode_covers(lock, owner, kind, lock_modes):
-            continue
-        if any((access_id, lock) in omitted for access_id in access_ids):
-            continue
-        return True
-    return False
-
-
 def _join_bytes_bound_to(
     owner: str,
     other_short: str,
@@ -3459,27 +3428,25 @@ def _safe_post_join_declines(
     points: Mapping[str, Mapping[str, Any]],
     spawn_index: Mapping[str, Any],
     names: Mapping[str, str] | None,
-    protection_a: Mapping[str, Any],
-    protection_b: Mapping[str, Any],
-    lock_modes: Mapping[tuple[str, str], frozenset[str]],
-    omitted: set[tuple[str, str]],
-    kind_a: str,
-    kind_b: str,
 ) -> bool:
-    """PAIR-05: drop a pair only when one end is provably post-join and every
-    other access is correctly guarded (GRD good).
+    """PAIR-05: drop a pair when one end is provably post-join.
 
     An end whose method joins -- the join provably bound to the *other* side's
     thread entry -- and whose *every* access follows that join cannot race the
-    worker it joined. Without that guard the "post-join" reasoning is the
-    excluded cross-lifetime PAIR-04 (a different lifetime's join does not order
-    this pair), so the pair is kept (fail-closed).
+    worker it joined. The join ordering itself establishes the happens-before
+    edge; the worker side does not additionally have to be lock-guarded.
+
+    Requiring that guard conflated two independent reasons to drop a pair: a
+    lock proves mutual exclusion, while a bound join proves one access happened
+    after the other. A worker that writes without a lock and a starter that
+    reads after `pthread_join` is the ordinary "join publishes the result"
+    pattern, not a race, so post-join ordering alone decides the decline.
     """
     short_a = _short_name((names or {}).get(owner_a, ""))
     short_b = _short_name((names or {}).get(owner_b, ""))
-    for owner, side_points, other_short, other_kind, other_owner, other_protection in (
-        (owner_a, points_a, short_b, kind_b, owner_b, protection_b),
-        (owner_b, points_b, short_a, kind_a, owner_a, protection_a),
+    for owner, side_points, other_short in (
+        (owner_a, points_a, short_b),
+        (owner_b, points_b, short_a),
     ):
         positions = _access_positions(points, side_points)
         if not positions:
@@ -3491,9 +3458,7 @@ def _safe_post_join_declines(
         # post-join of the candidate's other side.
         if min(positions) <= max(join_bytes):
             continue
-        # Safe only when the other side is GRD good.
-        if _side_guarded(other_protection, other_kind, other_owner, lock_modes, omitted):
-            return True
+        return True
     return False
 
 
