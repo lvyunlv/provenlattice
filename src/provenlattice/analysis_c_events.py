@@ -53,6 +53,7 @@ from .semantics.vocabulary import load_vocabulary
 # layers agree instead of drifting.
 from .sparsecfg import (
     _first_call_argument,
+    _operator_of,
     _root_identifier,
     _text_of,
     _unwrap_parentheses,
@@ -205,8 +206,12 @@ def _lock_designation(source: bytes, node) -> tuple[str, bool]:
 
     Every other non-name expression (`*p++`, `!m`, `-m`, a call result) also
     stays empty: the recovered root is not the object the lock call acts on.
-    The explicit subscript branch is the one non-name path that keeps its
-    root, because an element is still a member of the declared array.
+    Only address-of is transparent.  A bare dereference (`*p`, `(*p)`) stays
+    empty for the same reason: it names the pointee, and the pointer variable
+    can be reassigned between two calls, so its spelling is not an identity
+    for the lock.  The explicit subscript branch is the one non-name path that
+    keeps its root, because an element is still a member of the declared
+    array.
     """
     node = _unwrap_parentheses(node)
     pieces: list[str] = []
@@ -224,10 +229,19 @@ def _lock_designation(source: bytes, node) -> tuple[str, bool]:
             # inexact so two elements never read as one lock acquired twice.
             root = _root_identifier(source, node)
             return (root, False) if root else ("", False)
-        if kind in {"pointer_expression", "cast_expression"}:
-            node = node.child_by_field_name(
-                "argument" if kind == "pointer_expression" else "value")
-            node = _unwrap_parentheses(node)
+        if kind == "cast_expression":
+            node = _unwrap_parentheses(node.child_by_field_name("value"))
+            continue
+        if kind == "pointer_expression":
+            if not pieces and _operator_of(node, source) != "&":
+                # Only address-of is transparent. Any other pointer expression
+                # at the designation root -- `*p`, `(*p)`, or an operator the
+                # grammar did not name -- is not the pointer variable: `*p`
+                # may name a different lock after `p = q`. Inside a member
+                # path (`(*p).mutex`) the dereference is the same designation
+                # as `p->mutex`, so it stays transparent there.
+                return "", False
+            node = _unwrap_parentheses(node.child_by_field_name("argument"))
             continue
         if kind == "this":
             return "", False

@@ -12,8 +12,9 @@ Pins the events-layer fact this Issue delivers:
 * a ``this->member`` designation also stays empty and inexact: the events
   layer has no field-declaration identity, so the bare member name would
   merge with a same-named local lock;
-* every other non-name expression (``*p++``, ``!m``, ``m++``) stays empty and
-  inexact too -- only the explicit subscript path keeps its root;
+* every other non-name expression (``*p++``, ``!m``, ``m++``, and a bare
+  dereference ``*p`` / ``(*p)``) stays empty and inexact -- only the explicit
+  subscript path keeps its root;
 * the ``events:cpp`` version advances so a cache built under the previous
   payload semantics is re-analysed instead of reused;
 * plain root locks (``&g_lock``, ``m.try_lock()``, ``guard(m)``) are unchanged;
@@ -270,6 +271,61 @@ class NonNameLockIdentityTests(MemberPointerIdentityBase):
         for lock in locks:
             self.assertEqual(lock["lock_identity"], "")
             self.assertFalse(lock["subject_exact"])
+
+    def test_bare_dereference_is_unknown(self) -> None:
+        write(self.root, "src/deref.c",
+              "#include <pthread.h>\n"
+              "void f(pthread_mutex_t **p) {\n"
+              "    pthread_mutex_lock(*p);\n"
+              "    pthread_mutex_lock((*p));\n"
+              "}\n")
+        self.analyze()
+        locks = self.locks("src/deref.c")
+        self.assertEqual(len(locks), 2)
+        for lock in locks:
+            self.assertEqual(lock["lock_identity"], "")
+            self.assertFalse(lock["subject_exact"])
+
+    def test_reassigned_pointer_does_not_form_a_self_deadlock(self) -> None:
+        write(self.root, "src/reassign.c",
+              "#include <pthread.h>\n"
+              "void f(pthread_mutex_t **p, pthread_mutex_t **q) {\n"
+              "    pthread_mutex_lock(*p);\n"
+              "    p = q;\n"
+              "    pthread_mutex_lock(*p);\n"
+              "}\n")
+        self.analyze()
+        events = self.events("src/reassign.c")
+        locks = [event for event in events if event["event_type"] == "LOCK"]
+        self.assertEqual(len(locks), 2)
+        for lock in locks:
+            self.assertEqual(lock["lock_identity"], "")
+            self.assertFalse(lock["subject_exact"])
+        scenarios = build_lock_scenarios(events)
+        # With no identity the two acquisitions cannot be proved to be the
+        # same lock, so no self-deadlock may be claimed. An unpaired-acquire
+        # report stays, but it must be unresolved rather than exact.
+        self.assertEqual(
+            [c for c in scenarios["candidates"] if c["rule"] == "self_deadlock"],
+            [],
+        )
+        for candidate in scenarios["candidates"]:
+            self.assertFalse(candidate["exact"])
+            self.assertTrue(candidate["unresolved"])
+
+    def test_dereferenced_member_matches_the_arrow_designation(self) -> None:
+        # `(*p).mutex` and `p->mutex` are the same designation; the
+        # dereference is only the path to the member, not the lock itself.
+        write(self.root, "src/deref_member.c",
+              "#include <pthread.h>\n"
+              "struct S { pthread_mutex_t mutex; };\n"
+              "void f(struct S *p) {\n"
+              "    pthread_mutex_lock((*p).mutex);\n"
+              "}\n")
+        self.analyze()
+        lock = self.locks("src/deref_member.c")[0]
+        self.assertEqual(lock["lock_identity"], "p.mutex")
+        self.assertTrue(lock["subject_exact"])
 
 
 class EventsVersionFreshnessTests(MemberPointerIdentityBase):
