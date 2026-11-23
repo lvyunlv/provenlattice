@@ -48,10 +48,16 @@ from .parsing.cpp import CppTreeSitterParser
 from .parsing.events import EventExtractor
 from .semantics.vocabulary import load_vocabulary
 # Read-only reuse of the sparse_cfg walker's subject-recovery convention
-# (module-level pure helpers): the events layer records the same lock "root"
-# identifier and "exact" judgement the walker already computes, so the two
+# (module-level pure helpers): the events layer records the same lock
+# designation and "exact" judgement the walker already computes, so the two
 # layers agree instead of drifting.
-from .sparsecfg import _first_call_argument, _names_the_object, _root_identifier
+from .sparsecfg import (
+    _first_call_argument,
+    _operator_of,
+    _root_identifier,
+    _text_of,
+    _unwrap_parentheses,
+)
 from .storage import SQLiteStorage
 
 ANALYZER = analyzer_id("events", "cpp")
@@ -182,24 +188,97 @@ def _call_receiver_node(node) -> object | None:
     return callee.child_by_field_name("argument")
 
 
+def _lock_designation(source: bytes, node) -> tuple[str, bool]:
+    """The object a LOCK/UNLOCK names, at the finest proved designation.
+
+    A path made only of field selections is the object itself: `&s->mutex`
+    names `s.mutex`, not the root `s`.  A subscript leaves an element behind
+    (`p->slots[i]` is one of several locks), so that path keeps the root and
+    reports inexact rather than claiming the whole designation.  The separator
+    is `.` because the identity is read by humans and by lock-order queries
+    alike, and `a.nextmutex` would be ambiguous where `a.next.mutex` is not.
+
+    `this->m_` is left unresolved.  The events layer has no field-declaration
+    identity, so the bare member name would silently merge a member lock with
+    a same-named local lock in the same method -- an exactness claim the layer
+    cannot back.  Keeping it empty and inexact is the honest answer until a
+    declaration identity is available here.
+
+    Every other non-name expression (`*p++`, `!m`, `-m`, a call result) also
+    stays empty: the recovered root is not the object the lock call acts on.
+    Only address-of is transparent.  A bare dereference (`*p`, `(*p)`) stays
+    empty for the same reason: it names the pointee, and the pointer variable
+    can be reassigned between two calls, so its spelling is not an identity
+    for the lock.  The explicit subscript branch is the one non-name path that
+    keeps its root, because an element is still a member of the declared
+    array.
+    """
+    node = _unwrap_parentheses(node)
+    pieces: list[str] = []
+    while node is not None:
+        kind = node.type
+        if kind == "field_expression":
+            field = node.child_by_field_name("field")
+            if field is None:
+                return "", False
+            pieces.insert(0, _text_of(source, field))
+            node = _unwrap_parentheses(node.child_by_field_name("argument"))
+            continue
+        if kind == "subscript_expression":
+            # An element of an array is not the array; keep the root and stay
+            # inexact so two elements never read as one lock acquired twice.
+            root = _root_identifier(source, node)
+            return (root, False) if root else ("", False)
+        if kind == "cast_expression":
+            node = _unwrap_parentheses(node.child_by_field_name("value"))
+            continue
+        if kind == "pointer_expression":
+            if not pieces and _operator_of(node, source) != "&":
+                # Only address-of is transparent. Any other pointer expression
+                # at the designation root -- `*p`, `(*p)`, or an operator the
+                # grammar did not name -- is not the pointer variable: `*p`
+                # may name a different lock after `p = q`. Inside a member
+                # path (`(*p).mutex`) the dereference is the same designation
+                # as `p->mutex`, so it stays transparent there.
+                return "", False
+            node = _unwrap_parentheses(node.child_by_field_name("argument"))
+            continue
+        if kind == "this":
+            return "", False
+        break
+    if node is None:
+        return "", False
+    root = _root_identifier(source, node)
+    if not root:
+        return "", False
+    terminal = node.type == "identifier" or (
+        node.type == "type_identifier" and not node.named_children
+    )
+    if not terminal:
+        return "", False
+    return ".".join([root, *pieces]), True
+
+
 def _lock_subject(source: bytes, node, event_type: str) -> tuple[str, bool]:
-    """The root identifier of the object a LOCK/UNLOCK acts on, and exactness.
+    """The designation a LOCK/UNLOCK acts on, and its exactness.
 
     Same order the sparse_cfg walker applies: a RAII declaration names its
     constructor argument; a free-function call names its first argument
     (`pthread_mutex_lock(&m)` -> `m`); a member call names its receiver
-    (`m.lock()` -> `m`). ``exact`` is False when the name is only the root of a
-    longer designation (``index->slot_locks[i]`` names `index`, not one lock).
+    (`m.lock()` -> `m`).  Member paths are kept at member level when they are
+    field selections (`&s->mutex` -> `s.mutex`); a subscript path stays on its
+    root and is marked inexact (`p->slots[i]` names `p`, not one lock); a
+    `this->` path stays unresolved because this layer has no field-declaration
+    identity to separate it from a same-named local.
     """
     if event_type in {"LOCK", "UNLOCK"} and node.type == "declaration":
-        argument = _declaration_argument_node(node)
-        return _root_identifier(source, argument), _names_the_object(argument)
+        return _lock_designation(source, _declaration_argument_node(node))
     argument = _first_call_argument(node)
     if argument is not None:
-        return _root_identifier(source, argument), _names_the_object(argument)
+        return _lock_designation(source, argument)
     receiver = _call_receiver_node(node)
     if receiver is not None:
-        return _root_identifier(source, receiver), _names_the_object(receiver)
+        return _lock_designation(source, receiver)
     return "", False
 
 
