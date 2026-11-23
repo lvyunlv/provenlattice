@@ -116,15 +116,19 @@ def _declarator_contains(declarator, node) -> bool:
 
     `int x = c;` spells the read of `c` inside the same `declaration` node as
     the name `x`; treating the whole initializer as declarator context would
-    hide that read. Only the declarator chain (and an array extent) is context.
+    hide that read. An array's size expression is evaluated (`int a[n];` reads
+    `n`), so only the array declarator's name is context -- not its extent.
     """
     current = declarator
     while current is not None:
         if current.type == "init_declarator":
             current = current.child_by_field_name("declarator")
             continue
+        if current.type in {"array_declarator", "abstract_array_declarator"}:
+            inner = current.child_by_field_name("declarator")
+            return inner is not None and _contains(inner, node)
         if current.type in {
-            "pointer_declarator", "reference_declarator", "array_declarator",
+            "pointer_declarator", "reference_declarator",
             "function_declarator", "parenthesized_declarator",
         }:
             inner = current.child_by_field_name("declarator")
@@ -225,18 +229,63 @@ _UNEVALUATED_NODES = frozenset({
 })
 
 
+def _array_size(node):
+    """The extent expression of an array declarator, if it has one."""
+    size = node.child_by_field_name("size")
+    if size is not None:
+        return size
+    declared = node.child_by_field_name("declarator")
+    remaining = [
+        child for child in node.named_children
+        if declared is None
+        or child.start_byte != declared.start_byte
+        or child.end_byte != declared.end_byte
+    ]
+    return remaining[-1] if remaining else None
+
+
+def _in_any_vla_bound(node) -> bool:
+    """Whether `node` is evaluated as a VLA extent inside an ordinary sizeof."""
+    ancestor = node.parent
+    while ancestor is not None:
+        if ancestor.type in _UNEVALUATED_NODES:
+            return _in_vla_bound(node, ancestor)
+        ancestor = ancestor.parent
+    return False
+
+
+def _in_vla_bound(node, boundary) -> bool:
+    """Whether `node` is an array extent inside `boundary`.
+
+    `sizeof(int[n])` is usually unevaluated, but a variable-length array's
+    extent is evaluated, so the read of `n` is a real access.
+    """
+    ancestor = node.parent
+    while ancestor is not None and ancestor is not boundary:
+        if ancestor.type in {"array_declarator", "abstract_array_declarator"}:
+            size = _array_size(ancestor)
+            if (
+                size is not None
+                and size.start_byte <= node.start_byte
+                and node.end_byte <= size.end_byte
+            ):
+                return True
+        ancestor = ancestor.parent
+    return False
+
+
 def _in_unevaluated_context(node) -> bool:
     """Whether `node` is an operand the language does not evaluate.
 
     `sizeof(g)` names `g` but reads nothing; publishing an access for it would
     turn a compile-time query into a runtime race fact. `_Generic`'s
     controlling expression is unevaluated, while its selected association is
-    an ordinary expression.
+    an ordinary expression. A VLA extent inside `sizeof` is evaluated.
     """
     ancestor = node.parent
     while ancestor is not None:
         if ancestor.type in _UNEVALUATED_NODES:
-            return True
+            return not _in_vla_bound(node, ancestor)
         if ancestor.type == "generic_expression" and ancestor.named_children:
             control = ancestor.named_children[0]
             if (
@@ -250,19 +299,31 @@ def _in_unevaluated_context(node) -> bool:
     return False
 
 
-def _unevaluated_spans(root) -> tuple[tuple[int, int], ...]:
-    """Byte spans of every unevaluated operand expression in the file."""
-    spans: list[tuple[int, int]] = []
+def _unevaluated_spans(root) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]:
+    """Unevaluated spans and the VLA-extent spans evaluated inside them."""
+    unevaluated: list[tuple[int, int]] = []
+    evaluated: list[tuple[int, int]] = []
     for node in _walk_tree(root):
         if node.type in _UNEVALUATED_NODES:
-            spans.append((node.start_byte, node.end_byte))
+            unevaluated.append((node.start_byte, node.end_byte))
+            for inner in _walk_tree(node):
+                if inner.type in {"array_declarator", "abstract_array_declarator"}:
+                    size = _array_size(inner)
+                    if size is not None:
+                        evaluated.append((size.start_byte, size.end_byte))
         elif node.type == "generic_expression" and node.named_children:
             control = node.named_children[0]
-            spans.append((control.start_byte, control.end_byte))
-    return tuple(spans)
+            unevaluated.append((control.start_byte, control.end_byte))
+    return tuple(unevaluated), tuple(evaluated)
 
 
-def _inside_spans(byte: int, spans: tuple[tuple[int, int], ...]) -> bool:
+def _inside_spans(
+    byte: int,
+    spans: tuple[tuple[int, int], ...],
+    evaluated: tuple[tuple[int, int], ...] = (),
+) -> bool:
+    if any(start <= byte < end for start, end in evaluated):
+        return False
     return any(start <= byte < end for start, end in spans)
 
 
@@ -279,6 +340,9 @@ def _root_is_dereferenced(node, source: bytes) -> bool:
         if parent is None:
             return False
         if parent.type in {"parenthesized_expression", "cast_expression"}:
+            current = parent
+            continue
+        if parent.type == "binary_expression":
             current = parent
             continue
         argument = parent.child_by_field_name("argument")
@@ -333,6 +397,9 @@ def _access_expression(node, source: bytes):
         if parent.type in {"parenthesized_expression", "cast_expression"}:
             current = parent
             continue
+        if parent.type == "binary_expression":
+            current = parent
+            continue
         break
     return current
 
@@ -371,13 +438,15 @@ def _atomic_source_for_annotations(atomic, declarations, owners, byte: int, anno
     subject = annotations.get("subject", "")
     member = annotations.get("subject_member", "")
     declaration = _subject_declaration(declarations, byte, subject, annotations)
+    expression = annotations.get("expression", "") or ""
+    dereferenced = _is_dereference_expression(expression)
     if _atomic_member(atomic, declarations, byte, declaration, member):
         return "type_qualifier"
-    if atomic.is_atomic_declaration(declaration):
+    if atomic.is_atomic_array(declaration):
         return "type_qualifier"
-    if atomic.is_atomic_pointee(declaration) and _is_dereference_expression(
-        annotations.get("expression", "")
-    ):
+    if atomic.is_atomic_declaration(declaration) and not dereferenced:
+        return "type_qualifier"
+    if atomic.is_atomic_pointee(declaration) and dereferenced:
         return "type_qualifier"
     if declaration is None and subject:
         owner = owners.owner_of(byte, byte) if owners is not None else None
@@ -442,7 +511,7 @@ def _collect_atomic_candidates(
     covered_spans: set[tuple] = set()
     limitations: list[str] = []
     has_atomic_objects = bool(atomic.declaration_keys or atomic.recovered)
-    unevaluated = _unevaluated_spans(root)
+    unevaluated, evaluated = _unevaluated_spans(root)
 
     def append(owner, start_byte: int, end_byte: int, expression: str, annotations: dict) -> None:
         candidates.append({
@@ -468,7 +537,7 @@ def _collect_atomic_candidates(
             continue
         if point.start_byte is None or point.end_byte is None:
             continue
-        if _inside_spans(point.start_byte, unevaluated):
+        if _inside_spans(point.start_byte, unevaluated, evaluated):
             continue
         annotations = cfg.annotations.get(point.key()) or {}
         if not annotations.get("subject"):
@@ -521,6 +590,11 @@ def _collect_atomic_candidates(
         )
         if span_key in covered_spans:
             continue
+        expression_text = _node_text(source, expression_node)
+        dereferenced = (
+            _is_dereference_expression(expression_text)
+            or _root_is_dereferenced(node, source)
+        )
         atomic_source = ""
         recovered = None
         if declaration is not None:
@@ -529,22 +603,17 @@ def _collect_atomic_candidates(
                     atomic_source = "type_qualifier"
                 elif inside_region:
                     atomic_source = "atomic_block"
-            elif atomic.is_atomic_declaration(declaration):
+            elif atomic.is_atomic_array(declaration):
                 atomic_source = "type_qualifier"
-            elif atomic.is_atomic_pointee(declaration) and _is_dereference_expression(
-                _node_text(source, expression_node)
-            ):
+            elif atomic.is_atomic_declaration(declaration) and not dereferenced:
+                atomic_source = "type_qualifier"
+            elif atomic.is_atomic_pointee(declaration) and dereferenced:
                 atomic_source = "type_qualifier"
             elif inside_region:
                 atomic_source = "atomic_block"
         else:
             recovered = atomic.recovered_declaration(
                 subject, owner.start_byte, owner.end_byte, node.start_byte)
-            expression_text = _node_text(source, expression_node)
-            dereferenced = (
-                _is_dereference_expression(expression_text)
-                or _root_is_dereferenced(node, source)
-            )
             if recovered is not None:
                 # `_Atomic(int *) p` makes the pointer object atomic, not the
                 # plain int it points at: only a dereference of `p` is atomic.
@@ -560,11 +629,6 @@ def _collect_atomic_candidates(
             elif inside_region:
                 atomic_source = "atomic_block"
         if not atomic_source:
-            expression_text = _node_text(source, expression_node)
-            dereferenced = (
-                _is_dereference_expression(expression_text)
-                or _root_is_dereferenced(node, source)
-            )
             if (
                 has_atomic_objects
                 and recovered is None
@@ -582,6 +646,10 @@ def _collect_atomic_candidates(
             continue
         access = _semantic_access_kind(
             expression_node, "DEREFERENCE", source, cpp=cpp)
+        if access is None and _in_any_vla_bound(node):
+            # `sizeof(int[n])` is a sizeof, but the VLA extent is evaluated:
+            # the read of `n` is a real access.
+            access = "READ"
         if access is None:
             continue
         key = (

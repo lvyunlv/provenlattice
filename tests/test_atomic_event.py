@@ -323,6 +323,79 @@ void touch(void *p) {
 }
 """
 
+TYPEDEF_ATOMIC_POINTER_OBJECT = r"""
+typedef _Atomic(int *) P;
+P p;
+int *q;
+void touch(void) {
+    p = q;
+    *p = 1;
+}
+"""
+
+TYPEDEF_POINTER_TO_ATOMIC = r"""
+typedef _Atomic int *P;
+P p;
+int *q;
+void touch(void) {
+    p = q;
+    *p = 1;
+}
+"""
+
+MACRO_POINTER_TO_ATOMIC = r"""
+#define P _Atomic int *
+P p;
+int *q;
+void touch(void) {
+    p = q;
+    *p = 1;
+}
+"""
+
+RECOVERED_TYPEDEF_SCOPE = r"""
+typedef int T;
+void touch(void) {
+    { typedef _Atomic(int) T; T x; x = 1; }
+    T y;
+    y = 2;
+}
+"""
+
+MACRO_REDEFINITION = r"""
+#define AI int
+AI plain;
+#undef AI
+#define AI _Atomic int
+AI atomic;
+void touch(void) {
+    plain = 1;
+    atomic = 2;
+}
+"""
+
+VLA_BOUND = r"""
+void touch(void) {
+    _Atomic int n;
+    int a[n];
+    (void)a;
+}
+"""
+
+VLA_SIZEOF_BOUND = r"""
+void touch(void) {
+    _Atomic int n;
+    sizeof(int[n]);
+}
+"""
+
+POINTER_ARITHMETIC = r"""
+_Atomic int *p;
+void touch(void) {
+    *(p + 1) = 1;
+}
+"""
+
 RENAMED_REFORMATTED = r"""
 #include <pthread.h>
 
@@ -510,6 +583,51 @@ class AtomicEventTests(unittest.TestCase):
         self.assertTrue(any(
             limit.startswith("atomic_alias_unresolved")
             for limit in state.get("atomic_limitations", ())))
+
+    def test_typedef_of_atomic_pointer_object(self) -> None:
+        nodes, _env, _state = _materialize(TYPEDEF_ATOMIC_POINTER_OBJECT)
+        self.assertEqual(
+            {_annotations(node).get("expression", "") for node in nodes},
+            {"p"},
+        )
+
+    def test_typedef_of_pointer_to_atomic(self) -> None:
+        nodes, _env, _state = _materialize(TYPEDEF_POINTER_TO_ATOMIC)
+        self.assertEqual(
+            {_annotations(node).get("expression", "") for node in nodes},
+            {"*p"},
+        )
+
+    def test_macro_of_pointer_to_atomic(self) -> None:
+        nodes, _env, _state = _materialize(MACRO_POINTER_TO_ATOMIC)
+        self.assertEqual(
+            {_annotations(node).get("expression", "") for node in nodes},
+            {"*p"},
+        )
+
+    def test_recovered_typedef_respects_block_scope(self) -> None:
+        nodes, _env, _state = _materialize(RECOVERED_TYPEDEF_SCOPE)
+        self.assertEqual(_subjects(nodes), {"x"})
+
+    def test_macro_redefinition_is_position_aware(self) -> None:
+        nodes, _env, _state = _materialize(MACRO_REDEFINITION)
+        self.assertEqual(_subjects(nodes), {"atomic"})
+
+    def test_vla_bound_is_a_real_read(self) -> None:
+        nodes, _env, _state = _materialize(VLA_BOUND)
+        self.assertEqual(_subjects(nodes), {"n"})
+
+    def test_vla_sizeof_bound_is_a_real_read(self) -> None:
+        nodes, _env, _state = _materialize(VLA_SIZEOF_BOUND)
+        self.assertEqual(_subjects(nodes), {"n"})
+
+    def test_pointer_arithmetic_dereference_is_atomic(self) -> None:
+        nodes, _env, _state = _materialize(POINTER_ARITHMETIC)
+        self.assertTrue(nodes)
+        self.assertEqual(
+            {_annotations(node).get("expression", "") for node in nodes},
+            {"*(p + 1)"},
+        )
 
     def test_renaming_and_formatting_do_not_change_the_result(self) -> None:
         nodes, env, _state = _materialize(RENAMED_REFORMATTED)
