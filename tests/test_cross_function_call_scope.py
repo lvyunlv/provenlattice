@@ -1012,6 +1012,241 @@ class SameLineKnownCallTests(CrossFunctionCallScopeBase):
             for record in records
         ))
 
+    def test_same_line_lock_and_helper_keeps_the_held_lock(self) -> None:
+        # The unlock and its known CALL share one span; the access must still
+        # observe the state before the unlock, independent of event-id order.
+        records = self.accesses()
+        self.assertTrue(records)
+        for record in records:
+            self.assertEqual(record["held_locks"], ["global:m"])
+        self.assertTrue(any(
+            relation["relation"] == "SAME_LOCK"
+            and relation["subject"] == "global:shared"
+            for relation in self.lockset()["relations"]
+        ))
+
+
+class CrossFileStaticCollisionTests(CrossFunctionCallScopeBase):
+    """An external prototype must not follow a static same-name definition."""
+
+    FIXTURES = {
+        "src/a.c": CrossFileExplicitPrototypeTests.FIXTURES["src/a.c"],
+        "src/helper.c": "static void helper(void) {}\n",
+    }
+
+    def test_static_definition_is_not_bound_to_external_prototype(self) -> None:
+        self.assertTrue(any(
+            "cross_function_call" in record["limitation"]
+            for record in self.accesses()
+        ))
+
+
+class CrossFileSignatureNormalizationTests(CrossFunctionCallScopeBase):
+    """Parameter names differ between prototype and definition; types match."""
+
+    FIXTURES = {
+        "src/a.c": (
+            "#include <pthread.h>\n"
+            "pthread_mutex_t m;\n"
+            "int shared;\n"
+            "void helper(int);\n"
+            "void first(void) {\n"
+            "    pthread_mutex_lock(&m);\n"
+            "    shared++;\n"
+            "    helper(1);\n"
+            "    shared++;\n"
+            "    pthread_mutex_unlock(&m);\n"
+            "}\n"
+            "void second(void) {\n"
+            "    pthread_mutex_lock(&m);\n"
+            "    shared++;\n"
+            "    pthread_mutex_unlock(&m);\n"
+            "}\n"
+        ),
+        "src/helper.c": "void helper(int value) {}\n",
+    }
+
+    def test_parameter_names_do_not_block_the_definition_follow(self) -> None:
+        records = self.accesses()
+        self.assertTrue(records)
+        self.assertTrue(all(not record["limitation"] for record in records))
+
+
+class SameLineArrowKnownCallTests(CrossFunctionCallScopeBase):
+    """A known member call spelled with `->` must not make its line ambiguous."""
+
+    FIXTURE = (
+        "#include <pthread.h>\n"
+        "typedef struct { void (*lock)(void); } Ops;\n"
+        "Ops *ops;\n"
+        "pthread_mutex_t m;\n"
+        "int shared;\n"
+        "void helper(void) {}\n"
+        "void first(void) {\n"
+        "    pthread_mutex_lock(&m); ops->lock(); helper();\n"
+        "    shared++;\n"
+        "    pthread_mutex_unlock(&m);\n"
+        "}\n"
+        "void second(void) {\n"
+        "    pthread_mutex_lock(&m);\n"
+        "    shared++;\n"
+        "    pthread_mutex_unlock(&m);\n"
+        "}\n"
+    )
+
+    def test_arrow_known_call_is_filtered_before_ambiguity(self) -> None:
+        records = self.accesses()
+        self.assertTrue(records)
+        self.assertTrue(all(
+            "cross_function_call" not in record["limitation"]
+            for record in records
+        ))
+
+
+class FlowSuccessorTieBreakTests(unittest.TestCase):
+    THREADED = {
+        "aaa": {
+            "event_type": "CALL", "start_line": 4, "end_line": 4,
+            "start_byte": 30, "end_byte": 40,
+        },
+        "zzz": {
+            "event_type": "UNLOCK", "start_line": 4, "end_line": 4,
+            "start_byte": 30, "end_byte": 40,
+        },
+    }
+    ACCESS = {
+        "start_line": 3, "end_line": 3, "start_byte": 21, "end_byte": 24,
+    }
+
+    def test_cfg_rank_beats_event_id_for_same_span(self) -> None:
+        self.assertEqual(
+            _flow_successor(
+                self.ACCESS, self.THREADED,
+                cfg_rank={"zzz": 0, "aaa": 1},
+            ),
+            "zzz",
+        )
+
+    def test_swapping_the_event_ids_does_not_change_the_cfg_choice(self) -> None:
+        swapped = {"aaa": self.THREADED["zzz"], "zzz": self.THREADED["aaa"]}
+        self.assertEqual(
+            _flow_successor(
+                self.ACCESS, swapped,
+                cfg_rank={"aaa": 0, "zzz": 1},
+            ),
+            "aaa",
+        )
+
+    def test_no_rank_retains_the_legacy_id_tie_break(self) -> None:
+        self.assertEqual(_flow_successor(self.ACCESS, self.THREADED), "aaa")
+
+
+class SameSpanEventIdOrderTests(unittest.TestCase):
+    """Pure producer: swapping same-span node ids must not move the lock state."""
+
+    OWNER = "owner"
+    FILE = "file"
+
+    def _inputs(self, unlock_id: str, known_id: str):
+        def point(event_id, event_type, start, end, line, annotations=None):
+            return {
+                "event_id": event_id, "event_type": event_type,
+                "owner_symbol_id": self.OWNER,
+                "owner_qualified_name": "worker",
+                "file_id": self.FILE,
+                "start_line": line, "end_line": line,
+                "start_byte": start, "end_byte": end,
+                "annotations": annotations or {},
+            }
+        lock = {
+            "subject_decl": "global:m", "subject_storage": "global",
+            "subject_exact": "true", "acquire_kind": "blocking",
+            "raii": "false",
+        }
+        shared = {
+            "subject_decl": "global:shared", "subject_storage": "global",
+            "subject": "shared",
+        }
+        events = [
+            point("e_lock", "LOCK", 1, 10, 1, dict(lock)),
+            point("e_opaque", "CALL", 11, 20, 2),
+            point(unlock_id, "UNLOCK", 30, 39, 4, dict(lock)),
+            point(known_id, "CALL", 30, 39, 4),
+            point("e_access", "WRITE", 21, 24, 3, shared),
+        ]
+        edges = [
+            {"src_id": "e_lock", "dst_id": "e_opaque",
+             "kind": "CONTROL_REACHES",
+             "payload": {"owner_symbol_id": self.OWNER}},
+            {"src_id": "e_opaque", "dst_id": unlock_id,
+             "kind": "CONTROL_REACHES",
+             "payload": {"owner_symbol_id": self.OWNER}},
+            {"src_id": unlock_id, "dst_id": known_id,
+             "kind": "CONTROL_REACHES",
+             "payload": {"owner_symbol_id": self.OWNER}},
+        ]
+        lock_facts = [
+            {"event_id": "e_lock", "event_type": "LOCK",
+             "subject_exact": True, "acquire_kind": "blocking", "raii": False},
+            {"event_id": unlock_id, "event_type": "UNLOCK",
+             "subject_exact": True, "acquire_kind": "blocking", "raii": False},
+        ]
+        return events, edges, lock_facts
+
+    def _record(self, unlock_id: str, known_id: str) -> dict:
+        events, edges, lock_facts = self._inputs(unlock_id, known_id)
+        result = build_access_lockset(
+            events, edges, lock_facts,
+            call_callees={}, lock_free_callees=(),
+        )
+        records = [
+            record for record in result["access_locksets"]
+            if record["event_type"] == "WRITE"
+        ]
+        self.assertEqual(len(records), 1)
+        return records[0]
+
+    def test_id_order_does_not_move_the_observation_point(self) -> None:
+        first = self._record("z_unlock", "a_known")
+        second = self._record("a_unlock", "z_known")
+        for record in (first, second):
+            self.assertEqual(record["held_locks"], ["global:m"])
+            self.assertEqual(record["limitation"], ["cross_function_call"])
+
+
+class EntrySelectionTests(unittest.TestCase):
+    THREADED = {
+        "z_first_call": {
+            "event_type": "CALL", "start_line": 6,
+            "start_byte": 101, "end_byte": 123,
+        },
+        "m_lock": {
+            "event_type": "LOCK", "start_line": 6,
+            "start_byte": 101, "end_byte": 123,
+        },
+        "a_later_call": {
+            "event_type": "CALL", "start_line": 6,
+            "start_byte": 125, "end_byte": 133,
+        },
+    }
+    EDGES = [
+        {"src_id": "z_first_call", "dst_id": "m_lock"},
+        {"src_id": "m_lock", "dst_id": "a_later_call"},
+    ]
+    LOCK_FACTS = {
+        "m_lock": {
+            "lock_identity": "m", "subject_exact": True,
+            "acquire_kind": "blocking", "raii": False,
+        },
+    }
+
+    def test_entry_is_the_first_source_point_not_the_lowest_event_id(self) -> None:
+        # `a_later_call` sorts first by id; attaching the synthetic entry to it
+        # meets its held set with the empty entry and erases the lock.
+        held, _, _, _ = _threaded_dataflow(
+            self.THREADED, self.EDGES, self.LOCK_FACTS)
+        self.assertEqual(held["a_later_call"], frozenset({"m"}))
+
 
 if __name__ == "__main__":
     unittest.main()

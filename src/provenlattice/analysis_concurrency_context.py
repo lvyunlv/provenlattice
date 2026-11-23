@@ -34,6 +34,7 @@ thread-pool analysis.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -314,6 +315,95 @@ def _resolved_call_target(row: Mapping[str, Any]) -> str:
     return str(row["resolved_symbol_id"])
 
 
+_TYPE_WORDS = frozenset({
+    "void", "char", "short", "int", "long", "float", "double", "signed",
+    "unsigned", "bool", "_Bool", "wchar_t", "char8_t", "char16_t",
+    "char32_t", "const", "volatile", "restrict", "__restrict",
+    "struct", "class", "union", "enum", "typename", "auto",
+})
+_TAG_WORDS = frozenset({"struct", "class", "union", "enum"})
+
+
+def _split_top_level(text: str, separator: str) -> list[str]:
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for char in text:
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth = max(0, depth - 1)
+        if char == separator and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    return parts
+
+
+def _parameter_type_key(parameter: str) -> str:
+    """A parameter's type spelling, without its name or default value.
+
+    The graph's ``signature`` is raw parameter text, so a prototype
+    ``void helper(int);`` and a definition ``void helper(int value) {}`` are
+    two different strings for one function. Dropping the trailing parameter
+    name is enough to reconcile them without merging overloads: the builtin
+    type word (or struct/class tag) must be present, otherwise the parameter
+    keeps its raw spelling and the follow stays fail-closed.
+    """
+    text = " ".join(parameter.split())
+    if "=" in text:
+        text = text.split("=", 1)[0].rstrip()
+    if not text:
+        return ""
+    match = re.match(r"^(.*?)([A-Za-z_]\w*)$", text)
+    if match is None:
+        return text
+    prefix, trailing = match.group(1), match.group(2)
+    if trailing in _TYPE_WORDS:
+        return text
+    if not any(re.search(rf"\b{re.escape(word)}\b", prefix) for word in _TYPE_WORDS):
+        return text
+    words = prefix.strip().split()
+    if words and words[-1] in _TAG_WORDS:
+        return text
+    return prefix.rstrip()
+
+
+def _signature_key(signature) -> str:
+    """Normalize a function signature for declaration/definition matching."""
+    if not signature:
+        return ""
+    text = str(signature).strip()
+    open_index = text.find("(")
+    if open_index < 0:
+        return text
+    depth = 0
+    close_index = -1
+    for index in range(open_index, len(text)):
+        char = text[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                close_index = index
+                break
+    if close_index < 0:
+        return text
+    parameters = text[open_index + 1:close_index]
+    suffix = text[close_index + 1:]
+    if "<" in parameters or ">" in parameters:
+        # A template parameter list can contain commas; do not guess.
+        return text
+    parts = _split_top_level(parameters, ",")
+    if len(parts) == 1 and parts[0].strip() == "void":
+        parts = []
+    normalized = [_parameter_type_key(part) for part in parts if part.strip()]
+    return f"({','.join(normalized)}){suffix.strip()}"
+
+
 def call_lock_inputs(
     repo, database=None, *,
     files: Iterable[str] | None = None,
@@ -363,7 +453,7 @@ def call_lock_inputs(
             if symbol_id not in node_cache:
                 row = storage.row(
                     "SELECT n.id, n.kind, n.file_id, n.qualified_name, "
-                    "n.signature, n.metadata, f.path "
+                    "n.signature, n.language, n.metadata, f.path "
                     "FROM nodes n JOIN files f ON f.file_id=n.file_id "
                     "WHERE n.id=?", (symbol_id,),
                 )
@@ -400,7 +490,8 @@ def call_lock_inputs(
         }
 
         def call_leaf(name: str) -> str:
-            return str(name).rpartition(".")[2].rpartition("::")[2]
+            compact = "".join(str(name).split())
+            return re.split(r"::|->|\.", compact)[-1]
 
         def ordinary_rows(
             rows: list[dict], file_env: Mapping[str, Any] | None,
@@ -431,30 +522,60 @@ def call_lock_inputs(
             ]
 
         def definition_target(symbol_id: str) -> str:
-            """Follow a caller-local prototype to its unique definition.
+            """Follow a caller-local prototype to its unique compatible definition.
 
             A call with an explicit `void helper(void);` in the caller's file
             resolves to that declaration even when another file defines it.
             Rejecting the declaration as "no body" loses a provable lock-free
-            callee. Only one matching definition is accepted; zero or several
-            keep the call opaque (fail-closed).
+            callee. The follow is deliberately narrow: the candidate must have
+            the same normalized signature, the same kind, and -- across files
+            -- external linkage on both sides and compatible language linkage.
+            A missing linkage (an index built before this fact existed), a
+            `static` candidate, an incompatible C/C++ pair, or zero/several
+            candidates all keep the call opaque (fail-closed).
             """
             symbol = node(symbol_id)
             if symbol is None or symbol["kind"] not in {"Function", "Method"}:
                 return ""
             if symbol["metadata"].get("definition") is True:
                 return symbol_id
+            expected = _signature_key(symbol.get("signature"))
             candidates = storage.rows(
-                "SELECT id FROM nodes WHERE kind=? AND qualified_name=? "
-                "AND signature IS ? AND id != ?",
-                (symbol["kind"], symbol["qualified_name"],
-                 symbol["signature"], symbol_id),
+                "SELECT id FROM nodes WHERE kind=? AND qualified_name=? AND id != ?",
+                (symbol["kind"], symbol["qualified_name"], symbol_id),
             )
-            definitions = [
-                row["id"] for row in candidates
-                if (node(row["id"]) or {}).get("metadata", {}).get("definition") is True
-            ]
+            definitions: list[str] = []
+            for row in candidates:
+                candidate = node(row["id"])
+                if candidate is None:
+                    continue
+                if candidate["metadata"].get("definition") is not True:
+                    continue
+                if _signature_key(candidate.get("signature")) != expected:
+                    continue
+                if not _compatible_linkage(symbol, candidate):
+                    continue
+                definitions.append(row["id"])
             return definitions[0] if len(definitions) == 1 else ""
+
+        def _linkage(symbol: dict) -> str:
+            return str((symbol.get("metadata") or {}).get("linkage") or "")
+
+        def _compatible_linkage(declaration: dict, definition: dict) -> bool:
+            if declaration["file_id"] == definition["file_id"]:
+                return True
+            if _linkage(declaration) != "external" or _linkage(definition) != "external":
+                return False
+            left = str(declaration.get("language") or "")
+            right = str(definition.get("language") or "")
+            if not left or not right:
+                return False
+            if left == right:
+                return True
+            if {left, right} != {"c", "cpp"}:
+                return False
+            cpp_side = declaration if left == "cpp" else definition
+            return bool((cpp_side.get("metadata") or {}).get("c_linkage"))
 
         selected = frozenset(files) if files is not None else None
         pending: list[str] = []
