@@ -397,6 +397,7 @@ def _threaded_dataflow(
     lock_by_id: Mapping[str, Mapping[str, Any]],
     opaque_calls: frozenset[str] = frozenset(),
     raii_scopes: Iterable[tuple[str, int, int]] = (),
+    *, source_entry: bool = False,
 ) -> tuple[
     dict[str, frozenset[str]], dict[str, list[str]],
     dict[str, frozenset[str]], dict[str, frozenset[str]],
@@ -450,18 +451,23 @@ def _threaded_dataflow(
     # incoming edge (a body fragmented by returns keeps the entry explicit).
     entries: set[str] = {nid for nid in ids if not pred[nid]}
     if ids:
-        # The first point in *source* order, not by event id: several points
-        # share one line (`CALL`/`LOCK`/helper CALL on the lock line), and an
-        # id tie-break can attach the synthetic entry to a later point. The
-        # empty entry meet then erases the lock that point had acquired --
-        # nondeterministic held locks and lost limitations (issue #92 review).
-        first = min(ids, key=lambda nid: (
-            int(threaded[nid].get("start_line") or 0),
-            int(threaded[nid].get("start_byte") or 0),
-            int(threaded[nid].get("end_byte") or 0),
-            str(threaded[nid].get("event_type") or ""),
-            nid,
-        ))
+        if source_entry:
+            # The first point in *source* order, not by event id: several
+            # points share one line (`CALL`/`LOCK`/helper CALL on the lock
+            # line), and an id tie-break can attach the synthetic entry to a
+            # later point. The empty entry meet then erases the lock that
+            # point had acquired. The additive path opts in; the frozen
+            # legacy projection keeps its original id tie-break.
+            first = min(ids, key=lambda nid: (
+                int(threaded[nid].get("start_line") or 0),
+                int(threaded[nid].get("start_byte") or 0),
+                int(threaded[nid].get("end_byte") or 0),
+                str(threaded[nid].get("event_type") or ""),
+                nid,
+            ))
+        else:
+            first = min(ids, key=lambda nid: (
+                int(threaded[nid].get("start_line") or 0), nid))
         entries.add(first)
     for nid in entries:
         succ[_ENTRY].append(nid)
@@ -1048,7 +1054,8 @@ def build_access_lockset(
         })
         held_in, succ, tainted_in, tainted_out = _threaded_dataflow(
             threaded, edges_by_owner.get(owner, ()), lock_by_id,
-            opaque_calls=opaque_calls, raii_scopes=raii_scopes)
+            opaque_calls=opaque_calls, raii_scopes=raii_scopes,
+            source_entry=not legacy_call_limitations)
         cfg_rank = _cfg_rank(succ, threaded)
 
         # Identity limitations remain method-level: they describe the lock fact

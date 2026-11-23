@@ -1244,7 +1244,7 @@ class EntrySelectionTests(unittest.TestCase):
         # `a_later_call` sorts first by id; attaching the synthetic entry to it
         # meets its held set with the empty entry and erases the lock.
         held, _, _, _ = _threaded_dataflow(
-            self.THREADED, self.EDGES, self.LOCK_FACTS)
+            self.THREADED, self.EDGES, self.LOCK_FACTS, source_entry=True)
         self.assertEqual(held["a_later_call"], frozenset({"m"}))
 
 
