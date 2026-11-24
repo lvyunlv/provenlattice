@@ -7041,7 +7041,18 @@ def _uninit_disjoint(left: tuple, right: tuple) -> bool:
     return left[2] == right[2] and left_polarity != right_polarity
 
 
-def _uninit_write_reach(write_contexts: tuple[tuple, ...], use_context: tuple) -> str:
+def _uninit_write_reach(write: Mapping[str, Any], use_context: tuple) -> str:
+    """How one prior write reaches the use on one control context.
+
+    A write inside a branch condition (`n && (x = 1)`) may not execute on the
+    fall-through path, so it is never an unconditional definition: it stays
+    `possible` rather than covering the use. The published control positions
+    put such a write before the branch point, which is why the context alone
+    cannot prove coverage.
+    """
+    if write.get("conditional"):
+        return "possible"
+    write_contexts = tuple(write.get("contexts") or ())
     if _UNINIT_ENTRY in write_contexts:
         # A write before the first branch reaches every later path.
         return "covered"
@@ -7067,7 +7078,7 @@ def _uninit_evaluate(
     for context in use_contexts:
         outcome = "uncovered"
         for write in writes:
-            reach = _uninit_write_reach(tuple(write["contexts"]), context)
+            reach = _uninit_write_reach(write, context)
             if reach == "covered":
                 outcome = "covered"
                 break
@@ -7098,9 +7109,14 @@ def _uninit_record_key(record: Mapping[str, Any]) -> tuple[int, str]:
 
 def _uninit_collect(
     events: Iterable[Any],
-) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+) -> tuple[
+    dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, int],
+    dict[tuple[str, str], list[tuple[int, int]]],
+]:
     declarations: dict[str, dict[str, Any]] = {}
     accesses: list[dict[str, Any]] = []
+    branch_spans: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
+    branch_conditions: list[tuple[str, str]] = []
     population = {
         "declaration_events": 0,
         "declarations": 0,
@@ -7110,10 +7126,24 @@ def _uninit_collect(
         "access_events": 0,
         "unsupported_accesses": 0,
         "accesses_without_position": 0,
+        "bare_condition_reads": 0,
     }
     for event in events:
         event_type = str(_uninit_field(event, "event_type", "") or "")
         annotations = _uninit_annotations(event)
+        if event_type == "BRANCH":
+            start = _uninit_number(_uninit_field(event, "start_byte", 0))
+            end = _uninit_number(_uninit_field(event, "end_byte", 0))
+            owner = str(_uninit_field(event, "owner_symbol_id", "") or "")
+            path = str(
+                _uninit_field(event, "relative_path", "")
+                or annotations.get("relative_path", "") or "")
+            if start is not None and end is not None and end > start:
+                branch_spans[(path, owner)].append((start, end))
+            expression = str(annotations.get("expression") or "").strip()
+            if expression:
+                branch_conditions.append((owner, expression))
+            continue
         if event_type == "DECLARATION":
             fact = _uninit_fact(annotations, "local_declaration_v1")
             if fact is None:
@@ -7180,11 +7210,41 @@ def _uninit_collect(
             "start_line": _uninit_number(_uninit_field(event, "start_line", 0)) or 0,
             "end_line": _uninit_number(_uninit_field(event, "end_line", 0)) or 0,
             "start_byte": _uninit_number(_uninit_field(event, "start_byte", 0)),
+            "end_byte": _uninit_number(_uninit_field(event, "end_byte", 0)),
             "position": dict(position) if position is not None else None,
             "contexts": _uninit_contexts(position) if position is not None else (),
         })
     population["declarations"] = len(declarations)
-    return declarations, accesses, population
+    uninitialized_names_by_owner: dict[str, set[str]] = {}
+    for record in declarations.values():
+        if record["fact"].get("initialized") is not True:
+            uninitialized_names_by_owner.setdefault(
+                record["owner_symbol_id"], set()).add(record["name"])
+    for owner, expression in branch_conditions:
+        if expression in uninitialized_names_by_owner.get(owner, ()):
+            # A bare `if (x)` condition read of an uninitialized local. The
+            # producer does not publish a local_access_v1 fact for this shape,
+            # so the query cannot turn it into a candidate; counting it keeps
+            # the gap visible instead of silently reading as "analyzed and
+            # safe". An initialized local's bare condition is not a gap.
+            population["bare_condition_reads"] += 1
+    # A short-circuit/conditional initializer (`int y = (n && (x = 1));`) has
+    # no BRANCH point of its own, but the initializer span and expression are
+    # published. A write inside such an initializer is not an unconditional
+    # definition either, so it joins the same conditional-span index.
+    for record in declarations.values():
+        fact = record["fact"]
+        start = _uninit_number(fact.get("initializer_start_byte"))
+        end = _uninit_number(fact.get("initializer_end_byte"))
+        expression = str(fact.get("initializer_expression") or "")
+        if (
+            start is not None and end is not None and end > start
+            and any(operator in expression for operator in ("&&", "||", "?"))
+        ):
+            branch_spans[
+                (record["relative_path"], record["owner_symbol_id"])
+            ].append((start, end))
+    return declarations, accesses, population, branch_spans
 
 
 def _uninit_coverage_reasons(
@@ -7409,18 +7469,45 @@ def uninitialized_use(
     a read inside the same assignment's right-hand side (`x = x + 1`) sorts
     after that write. The facts carry no enclosing-statement span, so the
     query documents the gap rather than inventing an ordering.
+
+    Two more gaps stay explicit: a bare `if (x)` / `if (x) return` condition has
+    no published `local_access_v1` fact, so it is counted in
+    ``uninitialized_bare_condition_reads`` and exposed as
+    ``MISSING_INPUT_LOCAL_ACCESS_BARE_CONDITION`` instead of becoming a
+    candidate; `int x = x;` is treated as a declaration initializer definition
+    (known FN). A write inside a branch condition is never an unconditional
+    definition and keeps a `maybe_uninitialized` state. A missing storage class
+    or write target is an explicit ``unknown``, never a default-safe value.
     """
     del edges  # a pure reader over the published event facts, no walk
     wanted = _wanted(UNINITIALIZED_USE_KEY, defect_keys)
-    declarations, accesses, population = _uninit_collect(events)
+    declarations, accesses, population, conditional_spans = _uninit_collect(events)
     writes_by_declaration: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    unmodelled_writes_by_declaration: dict[
+        str, list[dict[str, Any]]] = defaultdict(list)
     for access in accesses:
-        if (
-            access["status"] == "supported"
-            and access["direction"] == "WRITE"
-            and access["target"] in {"direct", ""}
-        ):
-            writes_by_declaration[access["declaration"]].append(access)
+        if access["status"] != "supported" or access["direction"] != "WRITE":
+            continue
+        if access["target"] != "direct":
+            # A write whose target kind is missing or indirect is not a
+            # provable direct definition. Dropping it would let the query
+            # claim `uninitialized`; downgrading the declaration's uses to
+            # unknown keeps the missing fact visible.
+            unmodelled_writes_by_declaration[access["declaration"]].append(access)
+            continue
+        start = access.get("start_byte")
+        end = access.get("end_byte")
+        spans = conditional_spans.get(
+            (access["relative_path"], access["owner_symbol_id"]), ())
+        access["conditional"] = bool(
+            start is not None
+            and end is not None
+            and any(
+                span_start <= start and end <= span_end
+                for span_start, span_end in spans
+            )
+        )
+        writes_by_declaration[access["declaration"]].append(access)
 
     counts = {
         "uses": 0,
@@ -7489,8 +7576,17 @@ def uninitialized_use(
             state, outcomes, writes = _UNINIT_UNKNOWN, (), ()
         else:
             storage_class = str(fact.get("storage_class") or "")
-            if storage_class not in {"automatic", "register", ""}:
+            if storage_class not in {"automatic", "register"}:
                 reasons.add(f"storage_class_{storage_class or 'unknown'}")
+            prior_unmodelled = [
+                write
+                for write in unmodelled_writes_by_declaration.get(token, ())
+                if write.get("start_byte") is None
+                or use.get("start_byte") is None
+                or write["start_byte"] < use["start_byte"]
+            ]
+            if prior_unmodelled:
+                reasons.add("write_target_missing")
             writes = [
                 write for write in writes_by_declaration.get(token, ())
                 if write.get("start_byte") is not None
@@ -7504,11 +7600,16 @@ def uninitialized_use(
                 reasons.add("write_span_missing")
             contexts = (
                 _uninit_contexts(position) if isinstance(position, Mapping) else ())
+            hard_unknown = any(
+                reason.startswith("storage_class_")
+                or reason == "write_target_missing"
+                for reason in reasons
+            )
             state, outcomes = _uninit_evaluate(contexts, writes)
             if state is None:
                 state = _UNINIT_UNKNOWN
                 reasons.add("missing_control_position")
-            elif state != "initialized" and reasons:
+            elif hard_unknown or (state != "initialized" and reasons):
                 state = _UNINIT_UNKNOWN
 
         if reasons:
@@ -7533,6 +7634,11 @@ def uninitialized_use(
     truncated = len(candidates) > max_candidates
     coverage = {
         "uninitialized_population": dict(sorted(population.items())),
+        "uninitialized_bare_condition_reads":
+            population.get("bare_condition_reads", 0),
+        "uninitialized_missing_evidence": (
+            ["MISSING_INPUT_LOCAL_ACCESS_BARE_CONDITION"]
+            if population.get("bare_condition_reads") else []),
         "uninitialized_uses": counts["uses"],
         "uninitialized_uses_initialized": counts["uses_initialized"],
         "uninitialized_uses_unreachable": counts["uses_unreachable"],

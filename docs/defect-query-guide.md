@@ -64,7 +64,12 @@ provenlattice defect /path/to/repo --type all \
   `unknown`/coverage，不静默当作安全。局部指针解引用（`*p`）本身会触发
   `unknown_write_through`，因此该形状是显式 `unknown` 候选，而非 definite。
 - 已知 FN：写入 span 是目标标识符本身，同一赋值右侧的自引用
-  （`x = x + 1`）在 V1 中被当作写入之后的读取；该形状不在 V1 覆盖内。
+  （`x = x + 1`）在 V1 中被当作写入之后的读取；`int x = x;` 的初始化自读被当作
+  声明初始化，不产生候选。裸条件读取（`if (x)` / `if (x) return`）上游未发布
+  `local_access_v1`，V1 在 coverage 的 `uninitialized_bare_condition_reads` 中
+  计数，并在 `uninitialized_missing_evidence` 暴露
+  `MISSING_INPUT_LOCAL_ACCESS_BARE_CONDITION`，不静默当作安全；条件表达式内的
+  写入按 maybe/unknown 处理，不当作无条件定义。
 
 ## 3. 结果 JSON 结构
 
@@ -147,8 +152,8 @@ provenlattice defect /path/to/repo --type all \
 | FN | CONSUMES | 仅直接传递形状(`f(malloc(n))`),赋值形状走 DATA_FLOW_TO |
 | FN | sparse CFG | goto 目标不建模,短路坍缩为单 BRANCH |
 | 边界 | 全部 | 方法内分析,无跨函数边;无 SSA/points-to |
-| 边界 | uninitialized_use | 仅 straight-line/if-else/early-return；宏/goto/循环/条件表达式/写穿为显式 unknown |
-| FN | uninitialized_use | `x = x + 1` 的 RHS 读取被当作写入之后；参数/静态对象的调用期或零初始化语义不在候选内 |
+| 边界 | uninitialized_use | 仅 straight-line/if-else/early-return；宏/goto/循环/条件表达式/写穿为显式 unknown；条件表达式内的写入按 maybe/unknown |
+| FN | uninitialized_use | `x = x + 1` 的 RHS 读取被当作写入之后；`int x = x;` 自初始化不产生候选；裸条件 `if (x)` 读取上游未发布，仅在 `uninitialized_bare_condition_reads` 计数暴露；参数/静态对象的调用期或零初始化语义不在候选内 |
 | 边界 | error_handling | 精度受 API contract 知识限制 |
 | 边界 | taint_path | 仅 4 source/3 sink,无 sanitizer/跨函数 |
 

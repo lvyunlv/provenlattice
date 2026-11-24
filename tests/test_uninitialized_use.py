@@ -343,5 +343,118 @@ class RegistrationTests(UninitializedUseBase):
             result.candidates[0].metadata["state"], "uninitialized")
 
 
+class ConditionalWriteTests(UninitializedUseBase):
+    def test_logical_and_write_is_maybe(self) -> None:
+        candidate, _ = self.only(
+            "int f(int n) { int x; if (n && (x = 1)) { } return x; }\n")
+        self.assertEqual(candidate["metadata"]["state"], "maybe_uninitialized")
+        self.assertEqual(candidate["resolution_status"], "ambiguous")
+        self.assertIn("path_coverage_incomplete", candidate["missing_evidence"])
+
+    def test_initializer_logical_and_write_is_maybe(self) -> None:
+        candidate, _ = self.only(
+            "int f(int n) { int x; int y = (n && (x = 1)); return x; }\n")
+        self.assertEqual(candidate["metadata"]["state"], "maybe_uninitialized")
+        self.assertIn("path_coverage_incomplete", candidate["missing_evidence"])
+
+
+class BareConditionCoverageTests(UninitializedUseBase):
+    def test_bare_if_condition_is_counted_not_silent(self) -> None:
+        self.build(
+            "int f(int n) { int x; if (x) { return 1; } return 0; }\n")
+        env = self.query(defect_type=defect.UNINITIALIZED_USE)
+        self.assertEqual(env["status"], "available")
+        self.assertEqual(env["candidates"], [])
+        self.assertGreaterEqual(
+            env["coverage"]["uninitialized_bare_condition_reads"], 1)
+
+
+class KnownFalseNegativeTests(UninitializedUseBase):
+    def test_self_initializer_read_is_a_known_fn(self) -> None:
+        # `int x = x;` reads x before initialization, but the declaration's
+        # initializer is published as a definition and the initializer read is
+        # not a separate access fact. V1 keeps the known FN rather than
+        # guessing; the docs and capability matrix record it.
+        self.assertEqual(
+            self.candidates("int f(void) { int x = x; return x; }\n"), [])
+
+
+class SyntheticFailClosedTests(unittest.TestCase):
+    TOKEN = "local:src/a.c:f:x:1"
+
+    @staticmethod
+    def _position() -> dict:
+        return {
+            "predecessors": [], "entry": True, "status": "reachable",
+            "coverage_status": "complete", "coverage_reasons": [],
+        }
+
+    @staticmethod
+    def _event(kind: str, start: int, end: int, annotations: dict) -> dict:
+        return {
+            "event_type": kind, "event_id": f"event:{kind}:{start}",
+            "owner_symbol_id": "symbol:f", "owner_qualified_name": "f",
+            "relative_path": "src/a.c", "start_line": 1, "end_line": 1,
+            "start_byte": start, "end_byte": end, "matched_name": "x",
+            "annotations": annotations,
+        }
+
+    def _events(self, *, storage_class: str = "automatic",
+                write_target: str = "direct") -> list[dict]:
+        declaration = {
+            "declaration": self.TOKEN, "decl": "local:x", "kind": "scalar",
+            "storage": "local", "storage_class": storage_class, "type": "int",
+            "initialized": False, "status": "supported",
+            "coverage_status": "complete", "coverage_reasons": [],
+        }
+        access = {
+            "declaration": self.TOKEN, "direction": "READ", "target": "direct",
+            "status": "supported", "coverage_status": "complete",
+            "coverage_reasons": [],
+        }
+        write = {
+            "declaration": self.TOKEN, "direction": "WRITE",
+            "target": write_target, "status": "supported",
+            "coverage_status": "complete", "coverage_reasons": [],
+        }
+        position = self._position()
+        return [
+            self._event("DECLARATION", 1, 2, {
+                "local_declaration_v1": declaration,
+                "control_position_v1": position,
+            }),
+            self._event("WRITE", 10, 12, {
+                "local_access_v1": write,
+                "control_position_v1": position,
+            }),
+            self._event("READ", 20, 21, {
+                "local_access_v1": access,
+                "control_position_v1": position,
+            }),
+        ]
+
+    def test_missing_storage_class_is_unknown(self) -> None:
+        result = defect.uninitialized_use(
+            self._events(storage_class=""), [])
+        self.assertEqual(len(result.candidates), 1)
+        candidate = result.candidates[0]
+        self.assertEqual(candidate.metadata["state"], "unknown")
+        self.assertIn(
+            "storage_class_unknown", candidate.metadata["coverage_reasons"])
+
+    def test_empty_write_target_makes_the_use_unknown(self) -> None:
+        # A write whose target kind is missing is not a provable direct
+        # definition; treating it as "not a definition" would claim the use is
+        # definitely uninitialized. The missing value must downgrade the use to
+        # explicit unknown instead.
+        result = defect.uninitialized_use(
+            self._events(write_target=""), [])
+        self.assertEqual(len(result.candidates), 1)
+        candidate = result.candidates[0]
+        self.assertEqual(candidate.metadata["state"], "unknown")
+        self.assertIn(
+            "write_target_missing", candidate.metadata["coverage_reasons"])
+
+
 if __name__ == "__main__":
     unittest.main()
