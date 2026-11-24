@@ -1,7 +1,9 @@
 """Position- and reachability-scoped ``cross_function_call`` limitations."""
 
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from provenlattice.analysis_concurrency_context import query_access_lockset
@@ -668,6 +670,40 @@ class CrossFileLeafTests(CrossFunctionCallScopeBase):
     def test_current_cross_file_leaf_body_is_lock_free(self) -> None:
         self.assertEqual(
             [record["limitation"] for record in self.accesses()], [[], []])
+
+
+class EventsCoverageTests(CrossFunctionCallScopeBase):
+    """An available events envelope is insufficient when owner coverage is incomplete."""
+
+    FIXTURES = CrossFileLeafTests.FIXTURES
+
+    def _update_helper_metadata(self, expression: str) -> None:
+        with closing(sqlite3.connect(self.database)) as connection:
+            with connection:
+                connection.execute(
+                    f"UPDATE analysis_state SET metadata={expression} "
+                    "WHERE feature='events:cpp' AND file_id=("
+                    "SELECT file_id FROM files WHERE path='src/helper.c')",
+                )
+
+    def _assert_helper_is_opaque(self) -> None:
+        self.assertEqual(
+            [record["limitation"] for record in self.accesses()],
+            [[], ["cross_function_call"]],
+        )
+
+    def test_unbound_function_coverage_keeps_callee_opaque(self) -> None:
+        self._update_helper_metadata("json_set(metadata, '$.functions_unbound', 1)")
+        self._assert_helper_is_opaque()
+
+    def test_events_outside_owner_coverage_keeps_callee_opaque(self) -> None:
+        self._update_helper_metadata("json_set(metadata, '$.events_outside_owner', 1)")
+        self._assert_helper_is_opaque()
+
+    def test_old_index_without_owner_coverage_keeps_callee_opaque(self) -> None:
+        self._update_helper_metadata(
+            "json_remove(metadata, '$.functions_unbound', '$.events_outside_owner')")
+        self._assert_helper_is_opaque()
 
 
 class MissingCrossFileBodyTests(CrossFunctionCallScopeBase):

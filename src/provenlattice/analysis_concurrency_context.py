@@ -527,8 +527,27 @@ def call_lock_inputs(
                     or coverage.get("partial")
                 ):
                     event_cache[file_id] = None
-                else:
-                    event_cache[file_id] = candidate
+                    return event_cache[file_id]
+                state = storage.row(
+                    "SELECT metadata FROM analysis_state "
+                    "WHERE file_id=? AND feature='events:cpp'", (file_id,),
+                )
+                try:
+                    metadata = json.loads(state["metadata"]) if state else None
+                except (KeyError, TypeError, ValueError):
+                    metadata = None
+                if (
+                    not isinstance(metadata, Mapping)
+                    or any(
+                        type(metadata.get(key)) is not int or metadata[key] != 0
+                        for key in ("functions_unbound", "events_outside_owner")
+                    )
+                ):
+                    # Owner-binding counters are the proof that an empty event
+                    # list really covers the body. Old indexes and unavailable
+                    # or malformed counters cannot establish lock-free reachability.
+                    candidate = None
+                event_cache[file_id] = candidate
             return event_cache[file_id]
 
         file_paths = {
