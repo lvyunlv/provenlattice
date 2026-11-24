@@ -1,7 +1,9 @@
 """Position- and reachability-scoped ``cross_function_call`` limitations."""
 
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from provenlattice.analysis_concurrency_context import query_access_lockset
@@ -1246,6 +1248,60 @@ class EntrySelectionTests(unittest.TestCase):
         held, _, _, _ = _threaded_dataflow(
             self.THREADED, self.EDGES, self.LOCK_FACTS, source_entry=True)
         self.assertEqual(held["a_later_call"], frozenset({"m"}))
+
+
+class CoverageProofTests(CrossFunctionCallScopeBase):
+    """`complete` is not a coverage proof: the analyzer's own counters are."""
+
+    FIXTURES = ResolvedLeafTests.FIXTURES
+
+    def _set_counter(self, key: str, value: int) -> None:
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE analysis_state "
+                "SET metadata=json_set(metadata, ?, ?) "
+                "WHERE feature='events:cpp'",
+                (f"$.{key}", value),
+            )
+            connection.commit()
+
+    def _drop_counters(self) -> None:
+        with closing(sqlite3.connect(self.database)) as connection:
+            connection.execute(
+                "UPDATE analysis_state "
+                "SET metadata=json_remove(metadata, "
+                "'$.functions_unbound', '$.events_outside_owner') "
+                "WHERE feature='events:cpp'"
+            )
+            connection.commit()
+
+    def _assert_hold_interval_limited(self) -> None:
+        records = self.accesses()
+        limited = [record for record in records if record["limitation"]]
+        self.assertEqual(len(limited), 1)
+        # The access after the harness call inside `first` is the only one
+        # whose hold interval crosses the now-opaque call.
+        self.assertEqual(limited[0]["start_line"], 12)
+        self.assertEqual(limited[0]["limitation"], ["cross_function_call"])
+
+    def test_baseline_leaf_is_lock_free(self) -> None:
+        self.assertEqual(
+            [record["limitation"] for record in self.accesses()],
+            [[], [], []],
+        )
+
+    def test_unbound_function_blocks_lock_free_proof(self) -> None:
+        self._set_counter("functions_unbound", 1)
+        self._assert_hold_interval_limited()
+
+    def test_events_outside_owner_blocks_lock_free_proof(self) -> None:
+        self._set_counter("events_outside_owner", 1)
+        self._assert_hold_interval_limited()
+
+    def test_missing_counters_fail_closed(self) -> None:
+        # An older cache predates the counters; absence is not proof.
+        self._drop_counters()
+        self._assert_hold_interval_limited()
 
 
 if __name__ == "__main__":
