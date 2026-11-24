@@ -233,6 +233,137 @@ void work(int flag) {
         self.assertEqual(deformed, ["global:left#value", "global:right#value"])
 
 
+class LValueTargetTests(PointerTargetSetBase):
+    FIXTURE = """\
+struct S { int datum; };
+struct S s1;
+struct S s2;
+void f(void) {
+    struct S *p = &s1;
+    (0, p) = &s2;
+    p->datum = 1;
+}
+"""
+
+    def test_comma_lvalue_is_a_second_binding(self) -> None:
+        record = self.only()
+        self.assertEqual(record["candidates"], ["global:s1#datum", "global:s2#datum"])
+        self.assertEqual(record["resolution"], POINTER_MULTIPLE)
+
+
+class ConditionalLValueTests(PointerTargetSetBase):
+    FIXTURE = """\
+struct S { int datum; };
+struct S s1;
+struct S s2;
+void f(int cond) {
+    struct S *p = &s1;
+    (cond ? p : p) = &s2;
+    p->datum = 1;
+}
+"""
+
+    def test_conditional_lvalue_naming_one_pointer_is_a_binding(self) -> None:
+        record = self.only()
+        self.assertEqual(record["candidates"], ["global:s1#datum", "global:s2#datum"])
+        self.assertEqual(record["resolution"], POINTER_MULTIPLE)
+
+
+class AmbiguousLValueTests(PointerTargetSetBase):
+    FIXTURE = """\
+struct S { int datum; };
+struct S s1;
+struct S s2;
+struct S s3;
+void f(int cond) {
+    struct S *p = &s1;
+    struct S *q = &s3;
+    (cond ? p : q) = &s2;
+    p->datum = 1;
+}
+"""
+
+    def test_ambiguous_lvalue_fails_closed(self) -> None:
+        record = self.only()
+        self.assertEqual(record["candidates"], [])
+        self.assertEqual(record["resolution"], POINTER_UNKNOWN)
+        self.assertIn("ambiguous_lvalue_target", record["limitations"])
+
+
+class GotoTests(PointerTargetSetBase):
+    FIXTURE = """\
+struct S { int datum; };
+struct S s1;
+void f(int cond) {
+    struct S *p;
+    if (cond) goto skip;
+    p = &s1;
+skip:
+    p->datum = 1;
+}
+"""
+
+    def test_goto_bypass_fails_closed(self) -> None:
+        record = self.only()
+        self.assertEqual(record["candidates"], [])
+        self.assertEqual(record["resolution"], POINTER_UNKNOWN)
+        self.assertIn("goto_control_flow_unmodelled", record["limitations"])
+
+
+class TypedefArrayTargetTests(PointerTargetSetBase):
+    FIXTURE = """\
+typedef int A[2];
+A a;
+void f(void) {
+    int (*p)[2] = &a;
+    (*p)[0] = 1;
+}
+"""
+
+    def test_typedef_array_target_is_unknown(self) -> None:
+        records = self.records()
+        self.assertTrue(records)
+        for record in records:
+            self.assertEqual(record["resolution"], POINTER_UNKNOWN)
+            self.assertEqual(record["candidates"], [])
+            self.assertIn("target_array_unsupported", record["limitations"])
+
+
+class StructArrayMemberTargetTests(PointerTargetSetBase):
+    FIXTURE = """\
+struct S { int a[2]; };
+struct S s;
+void f(void) {
+    int (*p)[2] = &s.a;
+    (*p)[0] = 1;
+}
+"""
+
+    def test_struct_array_member_target_is_unknown(self) -> None:
+        records = self.records()
+        self.assertTrue(records)
+        for record in records:
+            self.assertEqual(record["resolution"], POINTER_UNKNOWN)
+            self.assertEqual(record["candidates"], [])
+            self.assertIn("target_array_unsupported", record["limitations"])
+
+
+class ScalarMemberTargetTests(PointerTargetSetBase):
+    FIXTURE = """\
+struct S { int datum; };
+struct S s;
+void f(void) {
+    int *p = &s.datum;
+    *p = 1;
+}
+"""
+
+    def test_scalar_member_target_is_allowed(self) -> None:
+        record = self.only()
+        self.assertEqual(record["candidates"], ["global:s#datum"])
+        self.assertEqual(record["resolution"], POINTER_UNIQUE)
+
+
 class ConditionalFirstAssignmentTests(PointerTargetSetBase):
     FIXTURE = """\
 struct S { int datum; };

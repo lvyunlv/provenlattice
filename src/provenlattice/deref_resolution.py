@@ -268,8 +268,9 @@ def build_deref_resolution(
 #     the query scope is local / parameter pointers only.
 #   * a target declared after the access resolves as unresolved (fail-closed);
 #     forward-declared file-level targets narrow coverage rather than guess.
-#   * `pointer_identity` is owner + `storage:name`; two shadowed frame-local
-#     declarations share that token while their candidate sets stay accurate.
+#   * `pointer_identity` is owner + `DeclarationIndex.scoped_identity`; a
+#     shadowed frame-local declaration is distinguished by file/function and
+#     its declaration byte offset.
 # ---------------------------------------------------------------------------
 
 POINTER_UNIQUE = "unique_candidate"
@@ -334,8 +335,33 @@ def _declarator_is_array(declarator: Any) -> bool:
     return node is not None and node.type == "array_declarator"
 
 
-def _array_declaration_keys(root: Any, source: bytes) -> set[tuple[int, str]]:
-    """`(declaration node start, name)` for every declared array object."""
+def _array_typedef_names(root: Any, source: bytes) -> set[str]:
+    names: set[str] = set()
+
+    def visit(node: Any) -> None:
+        if node.type == "type_definition":
+            declarator = node.child_by_field_name("declarator")
+            if _declarator_is_array(declarator):
+                name = _declarator_name(source, declarator)
+                if name:
+                    names.add(name)
+        for child in node.named_children:
+            visit(child)
+
+    visit(root)
+    return names
+
+
+def _array_declaration_keys(
+    root: Any, source: bytes, index: DeclarationIndex,
+) -> set[tuple[int, str]]:
+    """`(declaration node start, name)` for every declared array object.
+
+    Covers a direct `int a[2]`, a typedef array (`typedef int A[2]; A a;`) and
+    a typedef-array field.  A pointer *to* an array (`int (*p)[2]`, `A *p`) is
+    not itself an array and is left alone.
+    """
+    array_typedefs = _array_typedef_names(root, source)
     keys: set[tuple[int, str]] = set()
 
     def visit(node: Any) -> None:
@@ -343,10 +369,23 @@ def _array_declaration_keys(root: Any, source: bytes) -> set[tuple[int, str]]:
             "declaration", "field_declaration", "parameter_declaration",
         }:
             for declarator in node.children_by_field_name("declarator"):
-                if _declarator_is_array(declarator):
-                    name = _declarator_name(source, declarator)
-                    if name:
-                        keys.add((node.start_byte, name))
+                name = _declarator_name(source, declarator)
+                if not name:
+                    continue
+                direct = _declarator_is_array(declarator)
+                typedef_array = False
+                if not direct:
+                    core = declarator
+                    while core is not None and core.type == "init_declarator":
+                        core = core.child_by_field_name("declarator")
+                    if core is not None and core.type != "pointer_declarator":
+                        declaration = index.resolve(node.start_byte, name)
+                        typedef_array = (
+                            declaration is not None
+                            and declaration.type_token in array_typedefs
+                        )
+                if direct or typedef_array:
+                    keys.add((node.start_byte, name))
         for child in node.named_children:
             visit(child)
 
@@ -377,6 +416,19 @@ def _target_from_address_of(
         ):
             return None, ["target_member_unsupported"]
         member = _text_of(source, field)
+        root_declaration = index.resolve(
+            argument.start_byte, _text_of(source, argument))
+        if root_declaration is None:
+            return None, ["target_declaration_unresolved"]
+        field_declaration = index.resolve_member(
+            argument.start_byte, root_declaration.type_token, member)
+        if field_declaration is None:
+            return None, ["target_declaration_unresolved"]
+        if (
+            field_declaration.start_byte,
+            field_declaration.name,
+        ) in array_declarations:
+            return None, ["target_array_unsupported"]
         target = argument
     if target.type not in {"identifier", "type_identifier"}:
         return None, ["pointer_source_unsupported"]
@@ -452,6 +504,42 @@ def _inside_control(source: bytes, node: Any, function: Any) -> bool:
     return False
 
 
+def _lvalue_target_keys(
+    source: bytes, index: DeclarationIndex, node: Any,
+) -> tuple[set[tuple[int, str]], bool]:
+    """Declaration keys a C/C++ lvalue expression may write.
+
+    `(0, p)` writes `p` (the comma's right operand is the value), and
+    `(cond ? p : q)` writes one of the two arms.  Returns ``(keys, exact)``;
+    ``exact`` is false when an arm could not be modelled, so a caller that sees
+    the pointer among ``keys`` must fail closed rather than assume a complete
+    binding.  Non-lvalue pointer forms (`*p`, `p->f`) are not rebinding writes
+    and return an empty set.
+    """
+    node = _unwrap_parentheses(node)
+    if node is None:
+        return set(), False
+    if node.type == "identifier":
+        name = _text_of(source, node)
+        declaration = index.resolve(node.start_byte, name)
+        if declaration is None:
+            return set(), False
+        return {(declaration.start_byte, declaration.name)}, True
+    if node.type == "comma_expression":
+        return _lvalue_target_keys(
+            source, index, node.child_by_field_name("right"))
+    if node.type == "conditional_expression":
+        keys: set[tuple[int, str]] = set()
+        for field in ("consequence", "alternative"):
+            arm_keys, exact = _lvalue_target_keys(
+                source, index, node.child_by_field_name(field))
+            if not exact:
+                return keys, False
+            keys |= arm_keys
+        return keys, True
+    return set(), False
+
+
 def _assignments_for(
     source: bytes, index: DeclarationIndex, function: Any, pointer: Any,
 ) -> tuple[list[Any], list[str], int | None]:
@@ -469,6 +557,7 @@ def _assignments_for(
     rhs_nodes: list[Any] = []
     limitations: list[str] = []
     earliest: int | None = None
+    goto_seen = False
 
     def mark(start: int) -> None:
         nonlocal earliest
@@ -476,8 +565,11 @@ def _assignments_for(
             earliest = start
 
     def visit(node: Any) -> None:
+        nonlocal goto_seen
         if node.type == "function_definition" and node is not function:
             return
+        if node.type == "goto_statement":
+            goto_seen = True
         if node.type == "init_declarator":
             declarator = node.child_by_field_name("declarator")
             value = node.child_by_field_name("value")
@@ -486,22 +578,27 @@ def _assignments_for(
                 rhs_nodes.append(value)
                 mark(node.start_byte)
         elif node.type == "assignment_expression":
-            left = _unwrap_parentheses(node.child_by_field_name("left"))
+            left = node.child_by_field_name("left")
             right = node.child_by_field_name("right")
-            if left is not None and left.type == "identifier":
-                name = _text_of(source, left)
-                if name and index.resolve(left.start_byte, name) == pointer:
-                    mark(node.start_byte)
-                    if _inside_control(source, node, function):
-                        # `if (cond) p = &s1;` does not initialize p on every
-                        # path; a union with later assignments is partial.
-                        rhs_nodes.append(None)
-                        limitations.append("conditional_assignment")
-                    elif right is not None:
-                        rhs_nodes.append(right)
-                    else:
-                        rhs_nodes.append(None)
-                        limitations.append("pointer_assignment_unsupported")
+            keys, exact = _lvalue_target_keys(source, index, left)
+            pointer_key = (pointer.start_byte, pointer.name)
+            if pointer_key in keys:
+                mark(node.start_byte)
+                if not exact or len(keys) > 1:
+                    # `(cond ? p : q) = ...` may write p on one path only;
+                    # the complete rebinding cannot be claimed.
+                    rhs_nodes.append(None)
+                    limitations.append("ambiguous_lvalue_target")
+                elif _inside_control(source, node, function):
+                    # `if (cond) p = &s1;` does not initialize p on every
+                    # path; a union with later assignments is partial.
+                    rhs_nodes.append(None)
+                    limitations.append("conditional_assignment")
+                elif right is not None:
+                    rhs_nodes.append(right)
+                else:
+                    rhs_nodes.append(None)
+                    limitations.append("pointer_assignment_unsupported")
         elif node.type == "update_expression":
             argument = _unwrap_parentheses(node.child_by_field_name("argument"))
             if argument is not None and argument.type == "identifier":
@@ -524,6 +621,11 @@ def _assignments_for(
             visit(child)
 
     visit(function)
+    if goto_seen and rhs_nodes:
+        # A goto can jump over an assignment; byte order alone cannot prove
+        # definite initialization.
+        limitations.append("goto_control_flow_unmodelled")
+        rhs_nodes.append(None)
     if not rhs_nodes:
         limitations.append("pointer_assignment_missing")
     return rhs_nodes, sorted(set(limitations)), earliest
@@ -675,7 +777,7 @@ def build_pointer_target_sets(
             },
         }
     index = DeclarationIndex.build(source, relative_path, root)
-    array_declarations = _array_declaration_keys(root, source)
+    array_declarations = _array_declaration_keys(root, source, index)
     functions = _function_nodes(root)
 
     records: list[dict[str, Any]] = []
