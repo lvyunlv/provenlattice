@@ -259,6 +259,17 @@ def build_deref_resolution(
 #   * only a single field level on the pointer itself is composed into the
 #     candidate identity; nested/subscript paths stay target-level with a
 #     `member_path_unresolved` limitation.
+#
+# Registered limitations (review #99, non-blocking):
+#   * C++ reference aliases (`S *&r = p; r = &s2;`) and `std::swap(p, q)` are
+#     not modelled; a pointer changed only through such an alias can still
+#     report its direct address-of set.  Follow-up, not a silent claim.
+#   * `function_static` pointers are not frame-local and produce no record;
+#     the query scope is local / parameter pointers only.
+#   * a target declared after the access resolves as unresolved (fail-closed);
+#     forward-declared file-level targets narrow coverage rather than guess.
+#   * `pointer_identity` is owner + `storage:name`; two shadowed frame-local
+#     declarations share that token while their candidate sets stay accurate.
 # ---------------------------------------------------------------------------
 
 POINTER_UNIQUE = "unique_candidate"
@@ -382,16 +393,26 @@ def _targets_from_rhs(
 
 def _assignments_for(
     source: bytes, index: DeclarationIndex, function: Any, pointer: Any,
-) -> tuple[list[Any], list[str]]:
+) -> tuple[list[Any], list[str], int | None]:
     """Every initializer/assignment whose left side resolves to `pointer`.
 
     An update (`p++`), a compound assignment and a taken address (`&p`) are
     recorded as an unknown write: each can change the pointer's target set
     without an address-of RHS that this derivation can prove.  The unknown
     write propagates to ``resolution=unknown`` and clears the whole set.
+
+    Parentheses are unwrapped before the identifier check: `(p) = &s2` and
+    `((p)) = &s2` are the same rebinding as `p = &s2`, and `(p)++` is the same
+    update; missing them would publish a partial set as if it were unique.
     """
     rhs_nodes: list[Any] = []
     limitations: list[str] = []
+    earliest: int | None = None
+
+    def mark(start: int) -> None:
+        nonlocal earliest
+        if earliest is None or start < earliest:
+            earliest = start
 
     def visit(node: Any) -> None:
         if node.type == "function_definition" and node is not function:
@@ -402,29 +423,32 @@ def _assignments_for(
             name = _declarator_name(source, declarator)
             if value is not None and name and index.resolve(node.start_byte, name) == pointer:
                 rhs_nodes.append(value)
+                mark(node.start_byte)
         elif node.type == "assignment_expression":
-            left = node.child_by_field_name("left")
+            left = _unwrap_parentheses(node.child_by_field_name("left"))
             right = node.child_by_field_name("right")
             if left is not None and left.type == "identifier":
                 name = _text_of(source, left)
                 if name and index.resolve(left.start_byte, name) == pointer:
+                    mark(node.start_byte)
                     if right is not None:
                         rhs_nodes.append(right)
                     else:
                         rhs_nodes.append(None)
                         limitations.append("pointer_assignment_unsupported")
         elif node.type == "update_expression":
-            argument = node.child_by_field_name("argument")
+            argument = _unwrap_parentheses(node.child_by_field_name("argument"))
             if argument is not None and argument.type == "identifier":
                 name = _text_of(source, argument)
                 if name and index.resolve(argument.start_byte, name) == pointer:
+                    mark(node.start_byte)
                     rhs_nodes.append(None)
                     limitations.append("pointer_assignment_unsupported")
         elif (
             node.type == "pointer_expression"
             and _operator_of(node, source) == "&"
         ):
-            argument = node.child_by_field_name("argument")
+            argument = _unwrap_parentheses(node.child_by_field_name("argument"))
             if argument is not None and argument.type == "identifier":
                 name = _text_of(source, argument)
                 if name and index.resolve(argument.start_byte, name) == pointer:
@@ -436,19 +460,20 @@ def _assignments_for(
     visit(function)
     if not rhs_nodes:
         limitations.append("pointer_assignment_missing")
-    return rhs_nodes, sorted(set(limitations))
+    return rhs_nodes, sorted(set(limitations)), earliest
 
 
 def _pointer_state(
     source: bytes, index: DeclarationIndex, function: Any, pointer: Any,
-    cache: dict[tuple[int, int, str], tuple[set[str], str, list[str]]],
-) -> tuple[set[str], str, list[str]]:
+    cache: dict[tuple[int, int, str], tuple[set[str], str, list[str], int | None]],
+) -> tuple[set[str], str, list[str], int | None]:
     """The pointer's union target set, cached per function + declaration."""
     key = (function.start_byte, pointer.start_byte, pointer.name)
     cached = cache.get(key)
     if cached is not None:
         return cached
-    rhs_nodes, limitations = _assignments_for(source, index, function, pointer)
+    rhs_nodes, limitations, earliest = _assignments_for(
+        source, index, function, pointer)
     targets: set[str] = set()
     known = bool(rhs_nodes)
     for rhs in rhs_nodes:
@@ -459,12 +484,12 @@ def _pointer_state(
             break
         targets |= ids
     if not known or not targets:
-        state = (set(), POINTER_UNKNOWN, limitations)
+        state = (set(), POINTER_UNKNOWN, limitations, earliest)
     else:
         if len(rhs_nodes) > 1:
             limitations.append("flow_insensitive_assignment_union")
         resolution = POINTER_UNIQUE if len(targets) == 1 else POINTER_MULTIPLE
-        state = (targets, resolution, limitations)
+        state = (targets, resolution, limitations, earliest)
     cache[key] = state
     return state
 
@@ -584,7 +609,9 @@ def build_pointer_target_sets(
 
     records: list[dict[str, Any]] = []
     missing: set[str] = set()
-    state_cache: dict[tuple[int, int, str], tuple[set[str], str, list[str]]] = {}
+    state_cache: dict[
+        tuple[int, int, str], tuple[set[str], str, list[str], int | None]
+    ] = {}
     for event in events:
         if event.get("event_type") != "DEREFERENCE":
             continue
@@ -614,13 +641,20 @@ def build_pointer_target_sets(
                 event, subject, identity, set(), POINTER_UNKNOWN,
                 limitations + ["parameter_without_callsite"], start, end))
             continue
-        targets, resolution, state_limitations = _pointer_state(
+        targets, resolution, state_limitations, earliest = _pointer_state(
             source, index, function, declaration, state_cache)
         limitations.extend(state_limitations)
         if resolution == POINTER_UNKNOWN:
             records.append(_pointer_record(
                 event, subject, identity, set(), POINTER_UNKNOWN,
                 limitations, start, end))
+            continue
+        if earliest is not None and start < earliest:
+            # The access precedes every assignment: the pointer has no proven
+            # value here.  A later assignment's set would be a partial answer.
+            records.append(_pointer_record(
+                event, subject, identity, set(), POINTER_UNKNOWN,
+                limitations + ["access_before_assignment"], start, end))
             continue
         if not member:
             limitations.append("member_unresolved")

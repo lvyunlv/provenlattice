@@ -233,6 +233,105 @@ void work(int flag) {
         self.assertEqual(deformed, ["global:left#value", "global:right#value"])
 
 
+class ParenthesizedAssignmentTests(PointerTargetSetBase):
+    FIXTURE = """\
+struct S { int datum; };
+struct S s1;
+struct S s2;
+void f(void) {
+    struct S *p = &s1;
+    (p) = &s2;
+    p->datum = 1;
+}
+"""
+
+    def test_parenthesized_assignment_is_a_second_binding(self) -> None:
+        record = self.only()
+        self.assertEqual(record["candidates"], ["global:s1#datum", "global:s2#datum"])
+        self.assertEqual(record["resolution"], POINTER_MULTIPLE)
+        self.assertIn("flow_insensitive_assignment_union", record["limitations"])
+
+
+class DoubleParenthesizedAssignmentTests(PointerTargetSetBase):
+    FIXTURE = """\
+struct S { int datum; };
+struct S s1;
+struct S s2;
+void f(void) {
+    struct S *p = &s1;
+    ((p)) = &s2;
+    p->datum = 1;
+}
+"""
+
+    def test_double_parentheses_are_unwrapped(self) -> None:
+        record = self.only()
+        self.assertEqual(record["candidates"], ["global:s1#datum", "global:s2#datum"])
+        self.assertEqual(record["resolution"], POINTER_MULTIPLE)
+
+
+class ParenthesizedUpdateTests(PointerTargetSetBase):
+    FIXTURE = """\
+struct S { int datum; };
+struct S s1;
+void f(void) {
+    struct S *p = &s1;
+    (p)++;
+    p->datum = 1;
+}
+"""
+
+    def test_parenthesized_update_clears_the_set(self) -> None:
+        record = self.only()
+        self.assertEqual(record["candidates"], [])
+        self.assertEqual(record["resolution"], POINTER_UNKNOWN)
+        self.assertIn("pointer_assignment_unsupported", record["limitations"])
+
+
+class ParenthesizedConditionalAssignmentTests(PointerTargetSetBase):
+    FIXTURE = """\
+struct S { int datum; };
+struct S s1;
+struct S s2;
+struct S s3;
+void f(int cond) {
+    struct S *p = &s1;
+    (p) = cond ? &s2 : &s3;
+    p->datum = 1;
+}
+"""
+
+    def test_parenthesized_conditional_assignment_is_complete(self) -> None:
+        record = self.only()
+        self.assertEqual(
+            record["candidates"],
+            ["global:s1#datum", "global:s2#datum", "global:s3#datum"],
+        )
+        self.assertEqual(record["resolution"], POINTER_MULTIPLE)
+
+
+class AccessBeforeAssignmentTests(PointerTargetSetBase):
+    FIXTURE = """\
+struct S { int datum; };
+struct S s1;
+void f(void) {
+    struct S *p;
+    p->datum = 0;
+    p = &s1;
+    p->datum = 1;
+}
+"""
+
+    def test_access_before_the_first_assignment_is_unknown(self) -> None:
+        records = sorted(self.records(), key=lambda record: record["start_byte"])
+        self.assertEqual(len(records), 2, records)
+        self.assertEqual(records[0]["resolution"], POINTER_UNKNOWN)
+        self.assertEqual(records[0]["candidates"], [])
+        self.assertIn("access_before_assignment", records[0]["limitations"])
+        self.assertEqual(records[1]["resolution"], POINTER_UNIQUE)
+        self.assertEqual(records[1]["candidates"], ["global:s1#datum"])
+
+
 class UpdateExpressionTests(PointerTargetSetBase):
     FIXTURE = """\
 struct S { int datum; };
