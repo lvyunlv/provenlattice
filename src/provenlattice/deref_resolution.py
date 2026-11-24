@@ -326,8 +326,37 @@ def _containing_function(functions: list[Any], start: int, end: int) -> Any | No
     return min(matches, key=lambda node: node.end_byte - node.start_byte)
 
 
+def _declarator_is_array(declarator: Any) -> bool:
+    """The declared object itself is an array (not a pointer to one)."""
+    node = declarator
+    while node is not None and node.type == "init_declarator":
+        node = node.child_by_field_name("declarator")
+    return node is not None and node.type == "array_declarator"
+
+
+def _array_declaration_keys(root: Any, source: bytes) -> set[tuple[int, str]]:
+    """`(declaration node start, name)` for every declared array object."""
+    keys: set[tuple[int, str]] = set()
+
+    def visit(node: Any) -> None:
+        if node.type in {
+            "declaration", "field_declaration", "parameter_declaration",
+        }:
+            for declarator in node.children_by_field_name("declarator"):
+                if _declarator_is_array(declarator):
+                    name = _declarator_name(source, declarator)
+                    if name:
+                        keys.add((node.start_byte, name))
+        for child in node.named_children:
+            visit(child)
+
+    visit(root)
+    return keys
+
+
 def _target_from_address_of(
     source: bytes, index: DeclarationIndex, node: Any,
+    array_declarations: set[tuple[int, str]],
 ) -> tuple[str | None, list[str]]:
     """Resolve `&target` / `&target.field` to one identity, or fail closed."""
     node = _unwrap_parentheses(node)
@@ -357,6 +386,10 @@ def _target_from_address_of(
     declaration = index.resolve(target.start_byte, name)
     if declaration is None:
         return None, ["target_declaration_unresolved"]
+    if (declaration.start_byte, declaration.name) in array_declarations:
+        # Issue #99 excludes arrays; `&a` is an address but not the pointer
+        # object this derivation models.
+        return None, ["target_array_unsupported"]
     identity = index.scoped_identity(declaration)
     if member:
         identity = f"{identity}#{member}"
@@ -365,6 +398,7 @@ def _target_from_address_of(
 
 def _targets_from_rhs(
     source: bytes, index: DeclarationIndex, node: Any,
+    array_declarations: set[tuple[int, str]],
 ) -> tuple[set[str], list[str]]:
     """The provable target set of one pointer right-hand side."""
     node = _unwrap_parentheses(node)
@@ -378,17 +412,44 @@ def _targets_from_rhs(
             if arm is None:
                 limitations.append("conditional_arm_missing")
                 continue
-            identity, missing = _target_from_address_of(source, index, arm)
+            identity, missing = _target_from_address_of(
+                source, index, arm, array_declarations)
             limitations.extend(missing)
             if identity is not None:
                 arms.append(identity)
         if len(arms) != 2:
             return set(), sorted(set(limitations + ["conditional_arm_unsupported"]))
         return set(arms), sorted(set(limitations + ["conditional_pointer_source"]))
-    identity, limitations = _target_from_address_of(source, index, node)
+    identity, limitations = _target_from_address_of(
+        source, index, node, array_declarations)
     if identity is None:
         return set(), limitations
     return {identity}, []
+
+
+def _inside_control(source: bytes, node: Any, function: Any) -> bool:
+    """Whether an assignment may be skipped on some path of the function.
+
+    A declaration initializer is definite for its own scope and is not routed
+    here; an assignment inside `if`/loop/switch/case/conditional/short-circuit/
+    try/lambda can be skipped, so the pointer's set cannot be called complete.
+    """
+    ancestor = node.parent
+    while ancestor is not None and ancestor is not function:
+        if ancestor.type in {
+            "if_statement", "while_statement", "do_statement",
+            "for_statement", "for_range_loop", "switch_statement",
+            "case_statement", "conditional_expression", "lambda_expression",
+            "try_statement", "catch_clause",
+        }:
+            return True
+        if (
+            ancestor.type == "binary_expression"
+            and _operator_of(ancestor, source) in {"&&", "||"}
+        ):
+            return True
+        ancestor = ancestor.parent
+    return False
 
 
 def _assignments_for(
@@ -431,7 +492,12 @@ def _assignments_for(
                 name = _text_of(source, left)
                 if name and index.resolve(left.start_byte, name) == pointer:
                     mark(node.start_byte)
-                    if right is not None:
+                    if _inside_control(source, node, function):
+                        # `if (cond) p = &s1;` does not initialize p on every
+                        # path; a union with later assignments is partial.
+                        rhs_nodes.append(None)
+                        limitations.append("conditional_assignment")
+                    elif right is not None:
                         rhs_nodes.append(right)
                     else:
                         rhs_nodes.append(None)
@@ -465,6 +531,7 @@ def _assignments_for(
 
 def _pointer_state(
     source: bytes, index: DeclarationIndex, function: Any, pointer: Any,
+    array_declarations: set[tuple[int, str]],
     cache: dict[tuple[int, int, str], tuple[set[str], str, list[str], int | None]],
 ) -> tuple[set[str], str, list[str], int | None]:
     """The pointer's union target set, cached per function + declaration."""
@@ -477,7 +544,8 @@ def _pointer_state(
     targets: set[str] = set()
     known = bool(rhs_nodes)
     for rhs in rhs_nodes:
-        ids, problems = _targets_from_rhs(source, index, rhs)
+        ids, problems = _targets_from_rhs(
+            source, index, rhs, array_declarations)
         limitations.extend(problems)
         if not ids:
             known = False
@@ -543,9 +611,11 @@ def _member_for_access(
     return "", ["member_unresolved"]
 
 
-def _pointer_identity(event: Mapping[str, Any], declaration: Any) -> str:
+def _pointer_identity(
+    event: Mapping[str, Any], declaration: Any, index: DeclarationIndex,
+) -> str:
     owner = str(event.get("owner_symbol_id") or "")
-    token = f"{declaration.storage}:{declaration.name}"
+    token = index.scoped_identity(declaration)
     return f"{owner}#{token}" if owner else token
 
 
@@ -605,6 +675,7 @@ def build_pointer_target_sets(
             },
         }
     index = DeclarationIndex.build(source, relative_path, root)
+    array_declarations = _array_declaration_keys(root, source)
     functions = _function_nodes(root)
 
     records: list[dict[str, Any]] = []
@@ -635,14 +706,15 @@ def build_pointer_target_sets(
             continue
         member, member_missing = _member_for_access(source, root, start, end, subject)
         limitations = list(member_missing)
-        identity = _pointer_identity(event, declaration)
+        identity = _pointer_identity(event, declaration, index)
         if declaration.storage == STORAGE_PARAMETER:
             records.append(_pointer_record(
                 event, subject, identity, set(), POINTER_UNKNOWN,
                 limitations + ["parameter_without_callsite"], start, end))
             continue
         targets, resolution, state_limitations, earliest = _pointer_state(
-            source, index, function, declaration, state_cache)
+            source, index, function, declaration, array_declarations,
+            state_cache)
         limitations.extend(state_limitations)
         if resolution == POINTER_UNKNOWN:
             records.append(_pointer_record(

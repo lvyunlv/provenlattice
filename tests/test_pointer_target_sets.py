@@ -233,6 +233,71 @@ void work(int flag) {
         self.assertEqual(deformed, ["global:left#value", "global:right#value"])
 
 
+class ConditionalFirstAssignmentTests(PointerTargetSetBase):
+    FIXTURE = """\
+struct S { int datum; };
+struct S s1;
+void f(int cond) {
+    struct S *p;
+    if (cond) p = &s1;
+    p->datum = 1;
+}
+"""
+
+    def test_conditional_first_assignment_is_unknown(self) -> None:
+        record = self.only()
+        self.assertEqual(record["candidates"], [])
+        self.assertEqual(record["resolution"], POINTER_UNKNOWN)
+        self.assertIn("conditional_assignment", record["limitations"])
+
+
+class ShadowedPointerIdentityTests(PointerTargetSetBase):
+    FIXTURE = """\
+struct S { int datum; };
+struct S s1;
+struct S s2;
+void f(void) {
+    struct S *p = &s1;
+    {
+        struct S *p = &s2;
+        p->datum = 1;
+    }
+    p->datum = 2;
+}
+"""
+
+    def test_shadowed_pointers_get_declaration_level_identities(self) -> None:
+        records = self.records()
+        self.assertEqual(len(records), 2, records)
+        by_candidate = {
+            record["candidates"][0]: record for record in records
+        }
+        inner = by_candidate["global:s2#datum"]
+        outer = by_candidate["global:s1#datum"]
+        self.assertNotEqual(
+            inner["pointer_identity"], outer["pointer_identity"],
+            records,
+        )
+
+
+class ArrayTargetTests(PointerTargetSetBase):
+    FIXTURE = """\
+int a[2];
+void f(void) {
+    int (*p)[2] = &a;
+    (*p)[0] = 1;
+}
+"""
+
+    def test_array_target_is_unknown(self) -> None:
+        records = self.records()
+        self.assertTrue(records)
+        for record in records:
+            self.assertEqual(record["resolution"], POINTER_UNKNOWN)
+            self.assertEqual(record["candidates"], [])
+            self.assertIn("target_array_unsupported", record["limitations"])
+
+
 class ParenthesizedAssignmentTests(PointerTargetSetBase):
     FIXTURE = """\
 struct S { int datum; };
