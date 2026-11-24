@@ -54,6 +54,7 @@
 | race_condition | PR1 | C/C++ | 按需 | ✅ FUNCTIONAL + DIAGNOSTIC | overnight | 共享变量竞态 | ambiguous-only |
 | error_handling | PR1 | C/C++ | 按需 | ◐ SMOKE + DIAGNOSTIC | overnight | 未检查返回值 | 精度受 API contract 限制 |
 | taint_path | PR1 | C/C++ | 按需 | ◐ SMOKE + DIAGNOSTIC | overnight | source→sink | 4 source/3 sink 仅 |
+| uninitialized_use | #81（M9） | C/C++ | 按需 | ✅ implemented (diagnostic) | M9 Golden + 全量回归 | 局部对象定义前读取 | 仅 straight-line/if-else/early-return；宏/goto/循环/写穿为显式 unknown；`x = x + 1` 为已知 FN |
 
 ## L3 Task Services
 

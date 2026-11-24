@@ -26,7 +26,7 @@ provenlattice defect /path/to/repo --type double_free --json
 provenlattice defect /path/to/repo --type use_after_free --json
 provenlattice defect /path/to/repo --type null_flow --json
 
-# 全部九类
+# 全部已注册查询
 provenlattice defect /path/to/repo --type all --json
 
 # 带预算限制
@@ -47,6 +47,24 @@ provenlattice defect /path/to/repo --type all \
 | taint_path | taint | source→sink 传播 |
 | error_handling | 9.1 | 返回值未检查 |
 | mismatched_free | mismatch | 分配器与释放函数不配对（CWE-590/762/763） |
+| uninitialized_use | uninit | 方法内局部对象/局部指针在定义前读取（M9，CWE-457） |
+
+### uninitialized_use（M9）
+
+复用 `sparse_cfg` v7 的 `local_declaration_v1` / `local_access_v1` /
+`control_position_v1` 事实，按 scoped declaration token 连接声明与访问：
+
+- 状态：`uninitialized`（每条发布路径都无定义，`resolution_status=resolved`）、
+  `maybe_uninitialized`（部分路径有定义）、`unknown`（方法覆盖不完整，显式
+  带 coverage reason）、`initialized`（不产生候选）。
+- 反例不报：声明初始化、使用前赋值、if/else 两臂均赋值、未初始化分支
+  early return、静态零初始化、参数、不可达访问。
+- 边界：只覆盖 straight-line、if/else、early return；宏、goto、循环、
+  switch/条件表达式、lambda/异常、未知写穿、partial parse 为显式
+  `unknown`/coverage，不静默当作安全。局部指针解引用（`*p`）本身会触发
+  `unknown_write_through`，因此该形状是显式 `unknown` 候选，而非 definite。
+- 已知 FN：写入 span 是目标标识符本身，同一赋值右侧的自引用
+  （`x = x + 1`）在 V1 中被当作写入之后的读取；该形状不在 V1 覆盖内。
 
 ## 3. 结果 JSON 结构
 
@@ -129,6 +147,8 @@ provenlattice defect /path/to/repo --type all \
 | FN | CONSUMES | 仅直接传递形状(`f(malloc(n))`),赋值形状走 DATA_FLOW_TO |
 | FN | sparse CFG | goto 目标不建模,短路坍缩为单 BRANCH |
 | 边界 | 全部 | 方法内分析,无跨函数边;无 SSA/points-to |
+| 边界 | uninitialized_use | 仅 straight-line/if-else/early-return；宏/goto/循环/条件表达式/写穿为显式 unknown |
+| FN | uninitialized_use | `x = x + 1` 的 RHS 读取被当作写入之后；参数/静态对象的调用期或零初始化语义不在候选内 |
 | 边界 | error_handling | 精度受 API contract 知识限制 |
 | 边界 | taint_path | 仅 4 source/3 sink,无 sanitizer/跨函数 |
 
