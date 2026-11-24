@@ -30,11 +30,41 @@ byte-for-byte unchanged.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Iterable, Mapping
+
+from .analysis_query import query_analysis
+from .models import STORAGE_LOCAL, STORAGE_PARAMETER
+from .parsing.cpp import CppTreeSitterParser
+from .parsing.declarations import DeclarationIndex
 
 _MUST = "must"
 _MAY = "may"
 _UNKNOWN = "unknown"
+
+
+def _text_of(source: bytes, node: Any) -> str:
+    return source[node.start_byte : node.end_byte].decode("utf-8", "replace")
+
+
+def _operator_of(node: Any, source: bytes) -> str:
+    """The operator token of an expression node, whatever the grammar names it."""
+    operator = node.child_by_field_name("operator")
+    if operator is not None:
+        return _text_of(source, operator).strip()
+    for child in node.children:
+        if not child.is_named and child.type in {
+            "*", "&", "->", ".", "!", "&&", "||",
+            "==", "!=", "<", ">", "<=", ">=",
+        }:
+            return _text_of(source, child).strip()
+    return ""
+
+
+def _unwrap_parentheses(node: Any) -> Any:
+    while node is not None and node.type == "parenthesized_expression":
+        node = node.named_children[0] if node.named_children else None
+    return node
 
 
 def _annotations(event: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -209,4 +239,467 @@ def build_deref_resolution(
     return result
 
 
-__all__ = ["build_deref_resolution"]
+# ---------------------------------------------------------------------------
+# G2b-1 (issue-pilot #99): query-time pointer target sets.
+#
+# The derivation is deliberately narrow. It answers one question -- "which
+# declarations can this frame-local pointer reach at this access, when every
+# assignment to it is a provable address-of?" -- from a read-only re-parse of
+# the file plus the published sparse_cfg access events. It never writes a
+# fact, never mints a relation, and never feeds a detector.
+#
+# Fail-closed boundaries:
+#   * only frame-local pointers (`local` / `parameter`) are considered;
+#   * a parameter has no local initialization, and call-site binding belongs
+#     to D1, so a parameter access is `unknown`;
+#   * any assignment whose right-hand side is not `&target` or a two-arm
+#     conditional of two `&target` arms makes the whole pointer unknown;
+#   * a target identity must resolve through the read-only DeclarationIndex;
+#     a name that does not resolve is never guessed;
+#   * only a single field level on the pointer itself is composed into the
+#     candidate identity; nested/subscript paths stay target-level with a
+#     `member_path_unresolved` limitation.
+# ---------------------------------------------------------------------------
+
+POINTER_UNIQUE = "unique_candidate"
+POINTER_MULTIPLE = "multiple_candidates"
+POINTER_UNKNOWN = "unknown"
+
+_FRAME_POINTER_STORAGES = frozenset({STORAGE_LOCAL, STORAGE_PARAMETER})
+_LANGUAGE_BY_SUFFIX = {".c": "c"}
+
+
+def _language_for(relative_path: str) -> str:
+    return _LANGUAGE_BY_SUFFIX.get(Path(relative_path).suffix.lower(), "cpp")
+
+
+def _declarator_name(source: bytes, node: Any) -> str:
+    while node is not None:
+        if node.type in {"identifier", "field_identifier", "type_identifier"}:
+            return _text_of(source, node)
+        for field in ("declarator", "name", "function"):
+            child = node.child_by_field_name(field)
+            if child is not None:
+                found = _declarator_name(source, child)
+                if found:
+                    return found
+        for child in node.named_children:
+            found = _declarator_name(source, child)
+            if found:
+                return found
+        return ""
+    return ""
+
+
+def _function_nodes(root: Any) -> list[Any]:
+    functions: list[Any] = []
+
+    def visit(node: Any) -> None:
+        if node.type == "function_definition":
+            functions.append(node)
+            return
+        for child in node.named_children:
+            visit(child)
+
+    visit(root)
+    return functions
+
+
+def _containing_function(functions: list[Any], start: int, end: int) -> Any | None:
+    matches = [
+        node for node in functions
+        if node.start_byte <= start and end <= node.end_byte
+    ]
+    if not matches:
+        return None
+    return min(matches, key=lambda node: node.end_byte - node.start_byte)
+
+
+def _target_from_address_of(
+    source: bytes, index: DeclarationIndex, node: Any,
+) -> tuple[str | None, list[str]]:
+    """Resolve `&target` / `&target.field` to one identity, or fail closed."""
+    node = _unwrap_parentheses(node)
+    if node is None or node.type != "pointer_expression" or _operator_of(node, source) != "&":
+        return None, ["pointer_source_unsupported"]
+    target = _unwrap_parentheses(node.child_by_field_name("argument"))
+    if target is None:
+        return None, ["pointer_source_unsupported"]
+    member = ""
+    if target.type == "field_expression":
+        field = target.child_by_field_name("field")
+        argument = _unwrap_parentheses(target.child_by_field_name("argument"))
+        if (
+            _operator_of(target, source) != "."
+            or field is None
+            or argument is None
+            or argument.type != "identifier"
+        ):
+            return None, ["target_member_unsupported"]
+        member = _text_of(source, field)
+        target = argument
+    if target.type not in {"identifier", "type_identifier"}:
+        return None, ["pointer_source_unsupported"]
+    if target.type == "type_identifier" and target.named_children:
+        return None, ["pointer_source_unsupported"]
+    name = _text_of(source, target)
+    declaration = index.resolve(target.start_byte, name)
+    if declaration is None:
+        return None, ["target_declaration_unresolved"]
+    identity = index.scoped_identity(declaration)
+    if member:
+        identity = f"{identity}#{member}"
+    return identity, []
+
+
+def _targets_from_rhs(
+    source: bytes, index: DeclarationIndex, node: Any,
+) -> tuple[set[str], list[str]]:
+    """The provable target set of one pointer right-hand side."""
+    node = _unwrap_parentheses(node)
+    if node is None:
+        return set(), ["pointer_source_missing"]
+    if node.type == "conditional_expression":
+        arms: list[str] = []
+        limitations: list[str] = []
+        for field in ("consequence", "alternative"):
+            arm = node.child_by_field_name(field)
+            if arm is None:
+                limitations.append("conditional_arm_missing")
+                continue
+            identity, missing = _target_from_address_of(source, index, arm)
+            limitations.extend(missing)
+            if identity is not None:
+                arms.append(identity)
+        if len(arms) != 2:
+            return set(), sorted(set(limitations + ["conditional_arm_unsupported"]))
+        return set(arms), sorted(set(limitations + ["conditional_pointer_source"]))
+    identity, limitations = _target_from_address_of(source, index, node)
+    if identity is None:
+        return set(), limitations
+    return {identity}, []
+
+
+def _assignments_for(
+    source: bytes, index: DeclarationIndex, function: Any, pointer: Any,
+) -> tuple[list[Any], list[str]]:
+    """Every initializer/assignment whose left side resolves to `pointer`.
+
+    An update (`p++`), a compound assignment and a taken address (`&p`) are
+    recorded as an unknown write: each can change the pointer's target set
+    without an address-of RHS that this derivation can prove.  The unknown
+    write propagates to ``resolution=unknown`` and clears the whole set.
+    """
+    rhs_nodes: list[Any] = []
+    limitations: list[str] = []
+
+    def visit(node: Any) -> None:
+        if node.type == "function_definition" and node is not function:
+            return
+        if node.type == "init_declarator":
+            declarator = node.child_by_field_name("declarator")
+            value = node.child_by_field_name("value")
+            name = _declarator_name(source, declarator)
+            if value is not None and name and index.resolve(node.start_byte, name) == pointer:
+                rhs_nodes.append(value)
+        elif node.type == "assignment_expression":
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            if left is not None and left.type == "identifier":
+                name = _text_of(source, left)
+                if name and index.resolve(left.start_byte, name) == pointer:
+                    if right is not None:
+                        rhs_nodes.append(right)
+                    else:
+                        rhs_nodes.append(None)
+                        limitations.append("pointer_assignment_unsupported")
+        elif node.type == "update_expression":
+            argument = node.child_by_field_name("argument")
+            if argument is not None and argument.type == "identifier":
+                name = _text_of(source, argument)
+                if name and index.resolve(argument.start_byte, name) == pointer:
+                    rhs_nodes.append(None)
+                    limitations.append("pointer_assignment_unsupported")
+        elif (
+            node.type == "pointer_expression"
+            and _operator_of(node, source) == "&"
+        ):
+            argument = node.child_by_field_name("argument")
+            if argument is not None and argument.type == "identifier":
+                name = _text_of(source, argument)
+                if name and index.resolve(argument.start_byte, name) == pointer:
+                    rhs_nodes.append(None)
+                    limitations.append("pointer_address_escapes")
+        for child in node.named_children:
+            visit(child)
+
+    visit(function)
+    if not rhs_nodes:
+        limitations.append("pointer_assignment_missing")
+    return rhs_nodes, sorted(set(limitations))
+
+
+def _pointer_state(
+    source: bytes, index: DeclarationIndex, function: Any, pointer: Any,
+    cache: dict[tuple[int, int, str], tuple[set[str], str, list[str]]],
+) -> tuple[set[str], str, list[str]]:
+    """The pointer's union target set, cached per function + declaration."""
+    key = (function.start_byte, pointer.start_byte, pointer.name)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    rhs_nodes, limitations = _assignments_for(source, index, function, pointer)
+    targets: set[str] = set()
+    known = bool(rhs_nodes)
+    for rhs in rhs_nodes:
+        ids, problems = _targets_from_rhs(source, index, rhs)
+        limitations.extend(problems)
+        if not ids:
+            known = False
+            break
+        targets |= ids
+    if not known or not targets:
+        state = (set(), POINTER_UNKNOWN, limitations)
+    else:
+        if len(rhs_nodes) > 1:
+            limitations.append("flow_insensitive_assignment_union")
+        resolution = POINTER_UNIQUE if len(targets) == 1 else POINTER_MULTIPLE
+        state = (targets, resolution, limitations)
+    cache[key] = state
+    return state
+
+
+def _node_at(root: Any, start: int, end: int) -> Any | None:
+    return root.descendant_for_byte_range(start, end)
+
+
+def _deref_operand(source: bytes, node: Any) -> Any | None:
+    node = _unwrap_parentheses(node)
+    if (
+        node is not None
+        and node.type == "pointer_expression"
+        and _operator_of(node, source) == "*"
+    ):
+        return _unwrap_parentheses(node.child_by_field_name("argument"))
+    return None
+
+
+def _member_for_access(
+    source: bytes, root: Any, start: int, end: int, subject: str,
+) -> tuple[str, list[str]]:
+    """The single field level on the pointer, or '' with a limitation."""
+    node = _node_at(root, start, end)
+    current = node
+    while current is not None:
+        if current.type == "subscript_expression":
+            # A subscripted member path has no provable single field identity;
+            # keep the target-level candidate and say so.
+            return "", ["member_path_unresolved"]
+        if current.type == "field_expression":
+            field = current.child_by_field_name("field")
+            argument = _unwrap_parentheses(current.child_by_field_name("argument"))
+            if field is None or argument is None:
+                return "", ["member_path_unresolved"]
+            names_pointer = (
+                argument.type in {"identifier", "type_identifier"}
+                and _text_of(source, argument) == subject
+            ) or (
+                (operand := _deref_operand(source, argument)) is not None
+                and operand.type == "identifier"
+                and _text_of(source, operand) == subject
+            )
+            if not names_pointer:
+                return "", ["member_path_unresolved"]
+            return _text_of(source, field), []
+        if current.type in {"parenthesized_expression", "pointer_expression"}:
+            current = current.parent
+            continue
+        break
+    return "", ["member_unresolved"]
+
+
+def _pointer_identity(event: Mapping[str, Any], declaration: Any) -> str:
+    owner = str(event.get("owner_symbol_id") or "")
+    token = f"{declaration.storage}:{declaration.name}"
+    return f"{owner}#{token}" if owner else token
+
+
+def _pointer_record(
+    event: Mapping[str, Any], subject: str, pointer_identity: str,
+    candidates: set[str], resolution: str, limitations: list[str],
+    start: int, end: int,
+) -> dict[str, Any]:
+    annotations = event.get("annotations") or {}
+    event_id = event.get("event_id")
+    return {
+        "status": "available",
+        "access_event_id": event_id,
+        "owner": event.get("owner_qualified_name") or "",
+        "owner_symbol_id": event.get("owner_symbol_id") or "",
+        "expression": annotations.get("expression") or event.get("matched_name") or "",
+        "pointer": subject,
+        "pointer_identity": pointer_identity,
+        "candidates": sorted(candidates),
+        "resolution": resolution,
+        "subject_exact": False,
+        "limitations": sorted(set(limitations)),
+        "evidence_event_ids": [event_id] if event_id else [],
+        "evidence_spans": [[start, end]],
+        "start_line": int(event.get("start_line") or 0),
+        "start_byte": start,
+        "end_byte": end,
+    }
+
+
+def build_pointer_target_sets(
+    events: Iterable[Mapping[str, Any]], source: bytes, relative_path: str,
+) -> dict[str, Any]:
+    """Derive per-access pointer target sets from one file's sparse events.
+
+    Pure and deterministic: the same events + source yield the same records,
+    sorted by ``(owner_symbol_id, start_byte, access_event_id)``.
+    """
+    events = list(events)
+    parser = CppTreeSitterParser(language=_language_for(relative_path))
+    outcome = parser.parse_bytes(source, relative_path)
+    root = outcome.tree.root_node
+    if getattr(root, "has_error", False):
+        # A partial tree cannot prove a declaration or an arm; do not derive
+        # a candidate set from the parse that the indexer itself flagged.
+        return {
+            "pointer_targets": [],
+            "coverage": {
+                "accesses": 0, "unique_candidate": 0,
+                "multiple_candidates": 0, "unknown": 0,
+            },
+            "missing_evidence": ["partial_parse"],
+            "provenance": {
+                "upstream_analyzer": "sparse_cfg:cpp",
+                "derivation": "read-only tree-sitter + DeclarationIndex",
+                "default": "off",
+            },
+        }
+    index = DeclarationIndex.build(source, relative_path, root)
+    functions = _function_nodes(root)
+
+    records: list[dict[str, Any]] = []
+    missing: set[str] = set()
+    state_cache: dict[tuple[int, int, str], tuple[set[str], str, list[str]]] = {}
+    for event in events:
+        if event.get("event_type") != "DEREFERENCE":
+            continue
+        annotations = event.get("annotations") or {}
+        subject = str(annotations.get("subject") or "")
+        if not subject:
+            continue
+        start = int(event.get("start_byte") or 0)
+        end = int(event.get("end_byte") or 0)
+        function = _containing_function(functions, start, end)
+        if function is None:
+            continue
+        declaration = index.resolve(start, subject)
+        if declaration is None:
+            missing.add("pointer_declaration_unresolved")
+            records.append(_pointer_record(
+                event, subject, "", set(), POINTER_UNKNOWN,
+                ["pointer_declaration_unresolved"], start, end))
+            continue
+        if not declaration.is_pointer or declaration.storage not in _FRAME_POINTER_STORAGES:
+            continue
+        member, member_missing = _member_for_access(source, root, start, end, subject)
+        limitations = list(member_missing)
+        identity = _pointer_identity(event, declaration)
+        if declaration.storage == STORAGE_PARAMETER:
+            records.append(_pointer_record(
+                event, subject, identity, set(), POINTER_UNKNOWN,
+                limitations + ["parameter_without_callsite"], start, end))
+            continue
+        targets, resolution, state_limitations = _pointer_state(
+            source, index, function, declaration, state_cache)
+        limitations.extend(state_limitations)
+        if resolution == POINTER_UNKNOWN:
+            records.append(_pointer_record(
+                event, subject, identity, set(), POINTER_UNKNOWN,
+                limitations, start, end))
+            continue
+        if not member:
+            limitations.append("member_unresolved")
+        candidates = {
+            f"{target}#{member}" if member else target for target in targets
+        }
+        records.append(_pointer_record(
+            event, subject, identity, candidates, resolution, limitations,
+            start, end))
+
+    records.sort(key=lambda record: (
+        record["owner_symbol_id"], record["start_byte"],
+        record["access_event_id"] or "",
+    ))
+    return {
+        "pointer_targets": records,
+        "coverage": {
+            "accesses": len(records),
+            "unique_candidate": sum(
+                1 for record in records if record["resolution"] == POINTER_UNIQUE),
+            "multiple_candidates": sum(
+                1 for record in records if record["resolution"] == POINTER_MULTIPLE),
+            "unknown": sum(
+                1 for record in records if record["resolution"] == POINTER_UNKNOWN),
+        },
+        "missing_evidence": sorted(missing),
+        "provenance": {
+            "upstream_analyzer": "sparse_cfg:cpp",
+            "derivation": "read-only tree-sitter + DeclarationIndex",
+            "default": "off",
+        },
+    }
+
+
+def query_pointer_targets(
+    repo: str | Path, file_path: str, *, database: str | Path | None = None,
+) -> dict[str, Any]:
+    """Read one file's sparse facts and derive its pointer target sets.
+
+    C/C++ only, same-file scope, read-only and default OFF: nothing here is
+    registered as an analyzer or capability, and no detector consumes it.
+    Python/Java and unbuilt/stale/corrupt files fall through to the
+    sparse_cfg query's own honest status.
+    """
+    env = query_analysis(repo, "sparse_cfg", file_path=file_path, database=database)
+    empty = {
+        "pointer_targets": [],
+        "coverage": {
+            "accesses": 0, "unique_candidate": 0,
+            "multiple_candidates": 0, "unknown": 0,
+        },
+        "missing_evidence": [],
+    }
+    if env["status"] != "available":
+        return {"status": env["status"], "reason": env.get("reason"), **empty}
+    root = Path(repo).resolve()
+    path = Path(file_path)
+    if not path.is_absolute():
+        path = root / path
+    try:
+        source = path.read_bytes()
+    except OSError:
+        return {"status": "not_built", "reason": "file_not_readable", **empty}
+    relative = (
+        path.relative_to(root).as_posix()
+        if path.is_relative_to(root)
+        else Path(file_path).as_posix()
+    )
+    result = build_pointer_target_sets(env.get("events", []), source, relative)
+    result["status"] = "available"
+    result["reason"] = None
+    return result
+
+
+__all__ = [
+    "POINTER_UNIQUE",
+    "POINTER_MULTIPLE",
+    "POINTER_UNKNOWN",
+    "build_deref_resolution",
+    "build_pointer_target_sets",
+    "query_pointer_targets",
+]
