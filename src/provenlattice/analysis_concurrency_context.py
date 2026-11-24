@@ -451,6 +451,9 @@ def _signature_key(signature) -> str:
     return f"({','.join(normalized)}){suffix.strip()}"
 
 
+_EVENTS_ANALYZER = "events:cpp"
+
+
 def call_lock_inputs(
     repo, database=None, *,
     files: Iterable[str] | None = None,
@@ -476,19 +479,60 @@ def call_lock_inputs(
     )
     call_callees: dict[tuple[str, str, int], str | None] = {}
     with SQLiteStorage(database) as storage:
-        references_by_key: dict[tuple[str, str, int], list[dict]] = {}
-        for row in storage.rows(
-            "SELECT id, file_id, owner_symbol_id, start_line, raw_name, "
-            "status, resolved_symbol_id, metadata FROM raw_references "
-            "WHERE reference_type='CALLS' ORDER BY id"
-        ):
-            if row["start_line"] is None:
-                continue
-            key = (
-                str(row["file_id"]), str(row["owner_symbol_id"]),
-                int(row["start_line"]),
-            )
-            references_by_key.setdefault(key, []).append(row)
+        file_paths = {
+            row["file_id"]: row["path"]
+            for row in storage.rows("SELECT file_id, path FROM files")
+        }
+        reference_cache: dict[
+            str, dict[tuple[str, str, int], list[dict]]
+        ] = {}
+        all_loaded = files is None
+        if all_loaded:
+            # The repo-wide defect query wants every call; keep its single
+            # full-table read. Only the per-file lockset query is lazy.
+            for row in storage.rows(
+                "SELECT id, file_id, owner_symbol_id, start_line, raw_name, "
+                "status, resolved_symbol_id, metadata FROM raw_references "
+                "WHERE reference_type='CALLS' ORDER BY id"
+            ):
+                if row["start_line"] is None:
+                    continue
+                key = (
+                    str(row["file_id"]), str(row["owner_symbol_id"]),
+                    int(row["start_line"]),
+                )
+                reference_cache.setdefault(str(row["file_id"]), {}).setdefault(
+                    key, []).append(row)
+
+        def references_for(file_id: str) -> dict[tuple[str, str, int], list[dict]]:
+            """One file's CALLS rows, loaded on demand.
+
+            The per-file lockset query only needs the caller's file plus the
+            callee files its summaries traverse; a repo-wide full-table read
+            would make every call pay for every other file's calls.
+            """
+            cached = reference_cache.get(file_id)
+            if cached is not None:
+                return cached
+            if all_loaded:
+                reference_cache[file_id] = {}
+                return reference_cache[file_id]
+            by_key: dict[tuple[str, str, int], list[dict]] = {}
+            for row in storage.rows(
+                "SELECT id, file_id, owner_symbol_id, start_line, raw_name, "
+                "status, resolved_symbol_id, metadata FROM raw_references "
+                "WHERE reference_type='CALLS' AND file_id=? ORDER BY id",
+                (file_id,),
+            ):
+                if row["start_line"] is None:
+                    continue
+                key = (
+                    str(row["file_id"]), str(row["owner_symbol_id"]),
+                    int(row["start_line"]),
+                )
+                by_key.setdefault(key, []).append(row)
+            reference_cache[file_id] = by_key
+            return by_key
 
         node_cache: dict[str, dict | None] = {}
         event_cache: dict[str, Mapping[str, Any] | None] = {}
@@ -513,6 +557,38 @@ def call_lock_inputs(
             return node_cache[symbol_id]
 
         provided = events_by_file or {}
+        coverage_cache: dict[str, bool] = {}
+
+        def events_coverage(file_id: str) -> bool:
+            """Whether the events cache proves it covered this whole file.
+
+            `analysis_status == complete` is not enough: a method whose owner
+            binding failed contributes no events while the file still reads
+            complete. The analyzer records the two counters in its state
+            metadata; a missing counter (an older cache) is not proof either.
+            """
+            cached = coverage_cache.get(file_id)
+            if cached is not None:
+                return cached
+            row = storage.row(
+                "SELECT metadata FROM analysis_state "
+                "WHERE file_id=? AND feature=?",
+                (file_id, _EVENTS_ANALYZER),
+            )
+            metadata: dict = {}
+            if row is not None:
+                try:
+                    metadata = json.loads(row["metadata"] or "{}")
+                except (TypeError, ValueError):
+                    metadata = {}
+            covered = (
+                metadata.get("analysis_status") == "complete"
+                and not metadata.get("partial")
+                and metadata.get("functions_unbound") == 0
+                and metadata.get("events_outside_owner") == 0
+            )
+            coverage_cache[file_id] = covered
+            return covered
 
         def event_file(file_id: str, path: str) -> Mapping[str, Any] | None:
             if file_id not in event_cache:
@@ -525,16 +601,12 @@ def call_lock_inputs(
                     candidate.get("status") != "available"
                     or coverage.get("analysis_status") != "complete"
                     or coverage.get("partial")
+                    or not events_coverage(file_id)
                 ):
                     event_cache[file_id] = None
                 else:
                     event_cache[file_id] = candidate
             return event_cache[file_id]
-
-        file_paths = {
-            row["file_id"]: row["path"]
-            for row in storage.rows("SELECT file_id, path FROM files")
-        }
 
         def call_leaf(name: str) -> str:
             compact = "".join(str(name).split())
@@ -626,19 +698,20 @@ def call_lock_inputs(
 
         selected = frozenset(files) if files is not None else None
         pending: list[str] = []
-        for key in sorted(references_by_key):
-            if selected is not None and key[0] not in selected:
-                continue
-            rows = ordinary_rows(
-                references_by_key[key],
-                event_file(key[0], file_paths.get(key[0], "")),
-                key[1], key[2],
-            )
-            resolved = _resolved_call_target(rows[0]) if len(rows) == 1 else ""
-            target = definition_target(resolved) if resolved else ""
-            call_callees[key] = target or None
-            if target:
-                pending.append(target)
+        target_files = (
+            sorted(selected) if selected is not None else sorted(file_paths)
+        )
+        for file_id in target_files:
+            for key, rows in sorted(references_for(file_id).items()):
+                rows = ordinary_rows(
+                    rows, event_file(file_id, file_paths.get(file_id, "")),
+                    key[1], key[2],
+                )
+                resolved = _resolved_call_target(rows[0]) if len(rows) == 1 else ""
+                target = definition_target(resolved) if resolved else ""
+                call_callees[key] = target or None
+                if target:
+                    pending.append(target)
 
         while pending:
             symbol_id = pending.pop()
@@ -694,7 +767,7 @@ def call_lock_inputs(
             unknown = False
             for line in sorted(calls_by_line):
                 key = (str(symbol["file_id"]), symbol_id, line)
-                rows = references_by_key.get(key, [])
+                rows = references_for(str(symbol["file_id"])).get(key, [])
                 known = known_names_by_line.get(line)
                 if known:
                     rows = [
