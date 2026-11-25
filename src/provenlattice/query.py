@@ -590,14 +590,26 @@ class GraphQuery:
         for row in selected:
             item = decode_row(row)
             item_evidence = self._raw_reference_evidence(row)
+            if max_bytes is None:
+                data.append(item)
+                evidence.append(item_evidence)
+                continue
             trial_data = data + [item]
             trial_evidence = evidence + [item_evidence]
             trial_bytes = _bounded_payload_bytes(trial_data, trial_evidence)
-            if max_bytes is not None and trial_bytes > max_bytes:
+            if trial_bytes > max_bytes:
                 break
             data, evidence, payload_bytes = trial_data, trial_evidence, trial_bytes
-        if max_bytes is None:
+        if max_bytes is not None:
+            # payload_bytes was accumulated inside the bounded loop.
+            pass
+        elif limit is not None:
             payload_bytes = _bounded_payload_bytes(data, evidence)
+        else:
+            # No bound was requested: do not pay an extra full payload
+            # serialization just to report a byte count. Existing unbounded
+            # callers keep their original cost; bounded callers get `bytes`.
+            payload_bytes = None
 
         truncated = len(data) < total
         result = self._result(
