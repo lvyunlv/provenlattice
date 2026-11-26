@@ -469,10 +469,11 @@ class ScenarioWalkerByteSpanTests(unittest.TestCase):
         # (indirect field-callee READ), 5->6 for #82 buffer/extent/access
         # facts, 6->7 for #84 local declaration/access/control facts,
         # 7->8 for #89 G1 ATOMIC event recognition, 8->9 for #94
-        # memory-API destination extents, and 9->10 for #104 negative constant
-        # index/offset facts. Each advance invalidates the sparse_cfg cache so
-        # the new facts are rematerialized.
-        self.assertEqual(ANALYZER_VERSIONS["sparse_cfg:cpp"], 10)
+        # memory-API destination extents, 9->10 for #104 negative constant
+        # index/offset facts, and 10->11 for #134 local declaration/access
+        # fact gaps. Each advance invalidates the sparse_cfg cache so the new
+        # facts are rematerialized.
+        self.assertEqual(ANALYZER_VERSIONS["sparse_cfg:cpp"], 11)
 
     def test_sparse_cfg_version_bump_restalifies_cache(self) -> None:
         # Owner Decision V1 (sparse_cfg:cpp 1->2): the version genuinely
