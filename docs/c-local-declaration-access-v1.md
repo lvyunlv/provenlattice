@@ -214,14 +214,15 @@ independent and may coexist.
 
 ## 6. Compatibility and versioning
 
-`sparse_cfg:cpp` advances from v9 to v10. Existing v9 materialization is stale
-and is not returned as current facts. `events:cpp` is unchanged.
-`sparse_dfg:cpp` remains v4: its declared sparse-CFG dependency changes to v10,
-which forces rematerialization, while its legacy edge output remains unchanged.
+`sparse_cfg:cpp` advances from v10 to v11 (after #104 advanced v9 to v10).
+Existing v9/v10 materialization is stale and is not returned as current facts.
+`events:cpp` is unchanged. `sparse_dfg:cpp` remains v4: its declared sparse-CFG
+dependency changes to v11, which forces rematerialization, while its legacy
+edge output remains unchanged.
 
 Adding ordinary local READ/WRITE points can renumber source-order READ/WRITE
-ordinals within an owner. Consumers must not assume v9 access event ids survive
-the v10 migration. `DECLARATION` has its own event-type ordinal domain and does
+ordinals within an owner. Consumers must not assume v10 access event ids survive
+the v11 migration. `DECLARATION` has its own event-type ordinal domain and does
 not renumber DEREFERENCE or other event types.
 
 The legacy held-lock fact producer ignores declaration points and ordinary
