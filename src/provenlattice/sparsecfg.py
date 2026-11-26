@@ -261,7 +261,7 @@ def _operator_of(node: Any, source: bytes) -> str:
         return _text_of(source, operator).strip()
     for child in node.children:
         if not child.is_named and child.type in {
-            "*", "&", "->", ".", "!", "&&", "||",
+            "*", "&", "->", ".", "!", "&&", "||", "-",
             "==", "!=", "<", ">", "<=", ">=",
         }:
             return _text_of(source, child).strip()
@@ -4423,55 +4423,78 @@ def _array_extent_base(
     return None
 
 
-def _const_int(node: Any, source: bytes) -> int | None:
-    """Fold only target-independent, non-negative signed-int expressions.
+def _number_literal_int(
+    node: Any, source: bytes, maximum: int, minimum: int = 0
+) -> int | None:
+    """Parse a C/C++ integer literal without applying target-type semantics."""
+    if node is None or node.type != "number_literal":
+        return None
+    raw = _fact_expression_text(source, node)
+    text = _INT_SUFFIX.sub("", raw)
+    suffix = raw[len(text):]
+    if "u" in suffix.lower() or len(text) > 40:
+        return None
+    try:
+        # Python's base-0 parser rejects C's traditional octal spelling.
+        if re.fullmatch(r"0[0-7]+", text):
+            value = int(text, 8)
+        else:
+            value = int(text, 0)
+    except ValueError:
+        return None
+    return value if minimum <= value <= maximum else None
+
+
+def _const_int(node: Any, source: bytes, *, allow_negative: bool = False) -> int | None:
+    """Fold only target-independent signed-int expressions.
 
     Numeric literals and `*`/`<<`/`+` are retained only when every operand and
-    result fits a signed 32-bit int. Unsigned-suffixed literals, negative
-    values, wider results and invalid shift counts return None: without target
-    integer semantics, Python's unbounded arithmetic could otherwise invent a
-    value that C/C++ does not have. The bounds also make malformed/UB source
-    fail closed instead of raising or allocating an enormous integer.
+    result fits a signed 32-bit int. Unsigned-suffixed literals, wider results
+    and invalid shift counts return None: without target integer semantics,
+    Python's unbounded arithmetic could otherwise invent a value that C/C++
+    does not have. Negative constants are opt-in for index/offset consumers;
+    allocation sizes and extents retain the original non-negative contract.
+    The bounds also make malformed/UB source fail closed instead of raising or
+    allocating an enormous integer.
     """
     while node is not None and node.type == "parenthesized_expression":
         node = node.named_children[0] if node.named_children else None
     if node is None:
         return None
     maximum = 2_147_483_647
+    minimum = -maximum - 1 if allow_negative else 0
+    if allow_negative and node.type == "unary_expression" and (
+        _operator_of(node, source) == "-"
+    ):
+        argument = node.child_by_field_name("argument")
+        while argument is not None and argument.type == "parenthesized_expression":
+            argument = argument.named_children[0] if argument.named_children else None
+        # 2147483648 is not a positive signed-int literal, but its negation is
+        # the one additional value admitted by the signed 32-bit range.
+        magnitude = _number_literal_int(argument, source, maximum + 1)
+        return None if magnitude is None else -magnitude
     if node.type == "number_literal":
-        raw = _fact_expression_text(source, node)
-        text = _INT_SUFFIX.sub("", raw)
-        suffix = raw[len(text):]
-        if "u" in suffix.lower() or len(text) > 40:
-            return None
-        try:
-            # Python's base-0 parser rejects C's traditional octal spelling.
-            if re.fullmatch(r"0[0-7]+", text):
-                value = int(text, 8)
-            else:
-                value = int(text, 0)
-        except ValueError:
-            return None
-        return value if 0 <= value <= maximum else None
+        return _number_literal_int(node, source, maximum, minimum)
     if node.type == "binary_expression":
         operator = _operator_of(node, source)
         if operator not in {"*", "<<", "+"}:
             return None
-        left = _const_int(node.child_by_field_name("left"), source)
-        right = _const_int(node.child_by_field_name("right"), source)
+        left = _const_int(
+            node.child_by_field_name("left"), source, allow_negative=allow_negative
+        )
+        right = _const_int(
+            node.child_by_field_name("right"), source, allow_negative=allow_negative
+        )
         if left is None or right is None:
             return None
-        if operator == "*":
-            if right and left > maximum // right:
-                return None
-            return left * right
         if operator == "<<":
-            if right > 30 or left > (maximum >> right):
+            # C/C++ do not define a portable signed result for a negative
+            # left operand or shift count; retain the expression instead.
+            if left < 0 or right < 0 or right > 30 or left > (maximum >> right):
                 return None
             return left << right
-        if left > maximum - right:
-            return None
-        return left + right
+        value = left * right if operator == "*" else left + right
+        return value if minimum <= value <= maximum else None
     return None
 
 
@@ -4637,7 +4660,7 @@ def _access_facts(
                 "expression": None, "constant": None, "status": "unknown",
                 "limitation": "unparsed or multiple subscript indices",
             }
-        value = _const_int(index_node, source)
+        value = _const_int(index_node, source, allow_negative=True)
         fact: dict[str, Any] = {
             "access": access, "kind": "subscript", "unit": "elements",
             "expression": _fact_expression_text(source, index_node), "constant": value,
@@ -4672,12 +4695,14 @@ def _access_facts(
                     "status": "unknown", "limitation": "complex pointer arithmetic",
                 }
             if offset_node is not None:
-                value = _const_int(offset_node, source)
+                value = _const_int(offset_node, source, allow_negative=True)
+                if operator == "-" and value is not None:
+                    value = -value if value > -2_147_483_648 else None
                 offset_text = _fact_expression_text(source, offset_node)
                 fact = {
                     "access": access, "kind": "pointer_offset", "unit": "elements",
                     "expression": offset_text if operator == "+" else f"-({offset_text})",
-                    "constant": value if operator == "+" or value is None else -value,
+                    "constant": value,
                 }
                 if value is not None:
                     fact.update(status="constant", limitation="")
