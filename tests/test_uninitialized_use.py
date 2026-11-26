@@ -344,18 +344,18 @@ class RegistrationTests(UninitializedUseBase):
 
 
 class ConditionalWriteTests(UninitializedUseBase):
-    def test_logical_and_write_is_maybe(self) -> None:
+    def test_logical_and_write_is_unknown(self) -> None:
         candidate, _ = self.only(
             "int f(int n) { int x; if (n && (x = 1)) { } return x; }\n")
-        self.assertEqual(candidate["metadata"]["state"], "maybe_uninitialized")
+        self.assertEqual(candidate["metadata"]["state"], "unknown")
         self.assertEqual(candidate["resolution_status"], "ambiguous")
-        self.assertIn("path_coverage_incomplete", candidate["missing_evidence"])
+        self.assertIn("coverage_unsupported_short_circuit", candidate["missing_evidence"])
 
-    def test_initializer_logical_and_write_is_maybe(self) -> None:
+    def test_initializer_logical_and_write_is_unknown(self) -> None:
         candidate, _ = self.only(
             "int f(int n) { int x; int y = (n && (x = 1)); return x; }\n")
-        self.assertEqual(candidate["metadata"]["state"], "maybe_uninitialized")
-        self.assertIn("path_coverage_incomplete", candidate["missing_evidence"])
+        self.assertEqual(candidate["metadata"]["state"], "unknown")
+        self.assertIn("coverage_unsupported_short_circuit", candidate["missing_evidence"])
 
 
 class BareConditionCoverageTests(UninitializedUseBase):
@@ -364,7 +364,8 @@ class BareConditionCoverageTests(UninitializedUseBase):
             "int f(int n) { int x; if (x) { return 1; } return 0; }\n")
         env = self.query(defect_type=defect.UNINITIALIZED_USE)
         self.assertEqual(env["status"], "available")
-        self.assertEqual(env["candidates"], [])
+        self.assertEqual(len(env["candidates"]), 1)
+        self.assertEqual(env["candidates"][0]["metadata"]["state"], "uninitialized")
         self.assertGreaterEqual(
             env["coverage"]["uninitialized_bare_condition_reads"], 1)
 

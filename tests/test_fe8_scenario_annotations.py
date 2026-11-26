@@ -471,7 +471,7 @@ class ScenarioWalkerByteSpanTests(unittest.TestCase):
         # 7->8 for #89 G1 ATOMIC event recognition, and 8->9 for #94
         # memory-API destination extents. Each advance invalidates the
         # sparse_cfg cache so the new facts are rematerialized.
-        self.assertEqual(ANALYZER_VERSIONS["sparse_cfg:cpp"], 9)
+        self.assertEqual(ANALYZER_VERSIONS["sparse_cfg:cpp"], 10)
 
     def test_sparse_cfg_version_bump_restalifies_cache(self) -> None:
         # Owner Decision V1 (sparse_cfg:cpp 1->2): the version genuinely
