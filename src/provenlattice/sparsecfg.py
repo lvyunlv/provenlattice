@@ -1405,11 +1405,15 @@ class SparseCfgBuilder:
                 point.owner_qualified_name,
                 point.owner_signature,
             )
+            # Vocabulary hits share a walker-local seq; only the assigned
+            # owner/event/ordinal identity distinguishes their control points.
             return (
                 owner,
                 tuple(sorted(
                     (
-                        -1 if open_edge.src is None else open_edge.src.seq,
+                        ("", -1) if open_edge.src is None else (
+                            open_edge.src.event_type, open_edge.src.ordinal,
+                        ),
                         tuple(sorted(open_edge.flags)),
                     )
                     for open_edge in point.control_incoming or ()
@@ -3612,7 +3616,7 @@ class SparseCfgBuilder:
         if condition.type == "identifier":
             name = self._text(condition)
             declaration, _scoped = self._local_declaration_identity(condition, name)
-            if declaration is not None:
+            if declaration is not None or self._is_range_local(condition, name):
                 read = self._access_point(condition, "READ")
                 if read is not None and LOCAL_ACCESS_KEY in read.annotations:
                     read.control_incoming = [] if read.short_circuit_rhs else list(cond_opens)

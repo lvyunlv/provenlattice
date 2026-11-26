@@ -233,6 +233,30 @@ class SparseCfgLocalAccessFactGapTests(unittest.TestCase):
             self.event_identity(inner_write),
         )
 
+    def test_evaluation_predecessor_keeps_distinct_control_positions(self) -> None:
+        env = self.build(
+            "int f(void);\n"
+            "int g(void);\n"
+            "int independent_branches(int c, int d) {\n"
+            "    int x;\n"
+            "    int y;\n"
+            "    if (c) { x = f(); }\n"
+            "    if (d) { y = g(); }\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        first = self.local_event(env, "independent_branches", "WRITE", "x")
+        second = self.local_event(env, "independent_branches", "WRITE", "y")
+        first_position = self.fact(first, "control_position_v1")
+        second_position = self.fact(second, "control_position_v1")
+        self.assertIsNone(first_position["evaluation_predecessor"])
+        self.assertIsNone(second_position["evaluation_predecessor"])
+        first_call = first_position["predecessors"][0]
+        second_call = second_position["predecessors"][0]
+        self.assertEqual((first_call["event_type"], second_call["event_type"]), ("CALL", "CALL"))
+        self.assertNotEqual(first_call["ordinal"], second_call["ordinal"])
+        self.assertNotEqual(first_position["predecessors"], second_position["predecessors"])
+
     def test_cpp_if_init_statement_publishes_heading_declaration_and_accesses(self) -> None:
         env = self.build(
             "int if_init_statement(void) {\n"
@@ -456,6 +480,26 @@ class SparseCfgLocalAccessFactGapTests(unittest.TestCase):
             self.assertIn("unresolved_declaration", access["coverage_reasons"])
             position = self.fact(read, "control_position_v1")
             self.assertEqual(position["status"], "unknown")
+
+    def test_cpp_range_for_bare_condition_keeps_unresolved_read(self) -> None:
+        env = self.build(
+            "void range_for_bare_condition(void) {\n"
+            "    int values[1] = {};\n"
+            "    for (int x : values) { if (x) { } }\n"
+            "}\n",
+            relative_path="src/facts.cpp",
+        )
+        declaration = self.declaration(env, "range_for_bare_condition", "x")
+        read = self.local_event(env, "range_for_bare_condition", "READ", "x")
+        access = self.assert_linked(read, declaration)
+        self.assertEqual(access["status"], "unsupported")
+        self.assertEqual(access["declaration"], "")
+        self.assertEqual(access["coverage_status"], "unknown")
+        self.assertIn("unsupported_loop", access["coverage_reasons"])
+        self.assertIn("unresolved_declaration", access["coverage_reasons"])
+        position = self.fact(read, "control_position_v1")
+        self.assertEqual(position["status"], "unknown")
+        self.assertFalse(position["entry"])
 
     def test_cpp_range_for_keeps_nested_shadow_declaration_identity(self) -> None:
         env = self.build(
